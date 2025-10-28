@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>History – Login</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    .card { max-width: 420px; border: 1px solid #ddd; padding: 1rem; border-radius: 12px; }
+    input { font-size: 1.1rem; padding: .5rem .7rem; width: 100%; }
+    button { padding: .6rem .9rem; font-size: 1rem; margin-top: .8rem; cursor: pointer; }
+    .err { color: #b00020; margin-top: .5rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Admin / History</h2>
+    <form method="POST">
+      <label for="pwd">Password</label>
+      <input id="pwd" name="password" type="password" autofocus required />
+      <button type="submit">Enter</button>
+    </form>
+    {% if error %}
+      <div class="err">{{ error }}</div>
+    {% endif %}
+  </div>
+</body>
+</html>

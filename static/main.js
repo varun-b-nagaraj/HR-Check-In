@@ -31,7 +31,7 @@ form.addEventListener("submit", async (e) => {
 
   const s_number = document.getElementById("snum").value.trim();
   if (!s_number) {
-    msg.textContent = "Please enter your S-Number.";
+    msg.textContent = "Please enter your s-number.";
     return;
   }
 
