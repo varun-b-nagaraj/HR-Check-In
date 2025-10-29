@@ -319,6 +319,20 @@ def serve_photo(filename):
     return send_from_directory(PHOTOS_ROOT, filename, as_attachment=False)
 
 
+@app.route("/verify_password", methods=["POST"])
+def verify_password():
+    """Simple JSON endpoint to verify admin password for client-side actions.
+    The history login still uses the form POST to /history; this endpoint
+    only returns a JSON-OK result so the front-end can verify the same
+    ADMIN_PASSWORD without reusing the login form.
+    """
+    payload = request.get_json(silent=True) or {}
+    pwd = payload.get("password", "")
+    if pwd == ADMIN_PASSWORD:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False}), 403
+
+
 if __name__ == "__main__":
     # For Chromebook local testing
     app.run(host="0.0.0.0", port=5005, debug=True)
