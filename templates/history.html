@@ -577,6 +577,9 @@
     </div>
     <div class="topbar-right">
       <span class="page-title">Attendance History</span>
+      <a class="btn" id="btnExportStudents">Export Students</a>
+      <a class="btn" id="btnExportAttendance">Export Attendance</a>
+      <a class="btn" id="btnExportAnalytics">Export Analytics</a>
       <a class="btn btn-logout" href="/logout">Logout</a>
     </div>
   </div>
@@ -702,6 +705,8 @@
     <img id="modalImg" src="" alt="full photo" onclick="event.stopPropagation()">
   </div>
 
+
+
   <script>
     // Tab switching
     function switchTab(tabName) {
@@ -823,6 +828,20 @@
       if (e.key === 'Escape') {
         closeModal();
       }
+    });
+
+    // Export buttons
+
+    // Export buttons
+    document.getElementById('btnExportStudents').addEventListener('click', () => {
+      window.location.href = '/export/students';
+    });
+    document.getElementById('btnExportAttendance').addEventListener('click', () => {
+      const date = document.getElementById('dateSelect').value;
+      window.location.href = '/export/attendance?date=' + encodeURIComponent(date);
+    });
+    document.getElementById('btnExportAnalytics').addEventListener('click', () => {
+      window.location.href = '/export/analytics';
     });
   </script>
 </body>

@@ -7,12 +7,14 @@ from pathlib import Path
 import pandas as pd
 from flask import (
     Flask, jsonify, render_template, request,
-    redirect, url_for, session, send_from_directory
+    redirect, url_for, session, send_from_directory, send_file
 )
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from PIL import Image
 from zoneinfo import ZoneInfo
+from openpyxl.styles import PatternFill, Font
+from openpyxl.chart import BarChart, Reference
 
 APP_DIR = Path(__file__).parent.resolve()
 ROSTER_PATH = APP_DIR / "students.xlsx"   # <-- your roster
@@ -331,6 +333,207 @@ def verify_password():
     if pwd == ADMIN_PASSWORD:
         return jsonify({"ok": True})
     return jsonify({"ok": False}), 403
+
+
+# ---------- ROSTER management endpoints (admin only) ----------
+@app.route('/roster', methods=['GET'])
+def get_roster():
+    if not is_authed():
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 403
+    df = load_roster()
+    return jsonify({'ok': True, 'students': df.to_dict(orient='records')})
+
+
+@app.route('/roster/add', methods=['POST'])
+def add_roster():
+    if not is_authed():
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 403
+    payload = request.get_json(force=True)
+    # accept single or bulk
+    entries = payload.get('entries') or []
+    # entries may be a single dict
+    if isinstance(entries, dict):
+        entries = [entries]
+
+    if not entries:
+        # try single name/s_number
+        name = payload.get('name')
+        s_number = payload.get('s_number')
+        if name and s_number:
+            entries = [{'Name': name, 's-number': str(s_number).strip()}]
+
+    if not entries:
+        return jsonify({'ok': False, 'error': 'no entries provided'}), 400
+
+    # Load existing roster
+    df = pd.read_excel(ROSTER_PATH)
+    # Normalize column names
+    cols = {c.lower().strip(): c for c in df.columns}
+    name_col = cols.get('name') or cols.get('student') or 'Name'
+    snum_col = cols.get('s-number') or cols.get('s number') or 's-number'
+    # Ensure columns exist
+    if name_col not in df.columns:
+        df[name_col] = ''
+    if snum_col not in df.columns:
+        df[snum_col] = ''
+
+    added = []
+    for ent in entries:
+        n = (ent.get('Name') or ent.get('name') or '').strip()
+        s = str(ent.get('s-number') or ent.get('s_number') or '').strip()
+        if not n or not s:
+            continue
+        # check for duplicates by s-number
+        if ((df[snum_col].astype(str).str.strip()) == s).any():
+            continue
+        df = df.append({name_col: n, snum_col: s}, ignore_index=True)
+        added.append({'Name': n, 's-number': s})
+
+    # Save back to students.xlsx
+    df.to_excel(ROSTER_PATH, index=False)
+
+    return jsonify({'ok': True, 'added': added})
+
+
+# ---------- EXPORT endpoints (admin only) ----------
+def _make_attendance_export(selected_date: str):
+    # Build a workbook combining roster and attendance for selected_date
+    roster = load_roster()
+    xlsx_path = APP_DIR / f"attendance_{selected_date}.xlsx"
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Attendance_{selected_date}"
+
+    headers = ["S-Number", "Name", "Timestamp", "Present", "PhotoPath"]
+    ws.append(headers)
+
+    present_ids = set()
+    attendance_map = {}
+    if xlsx_path.exists():
+        awb = load_workbook(xlsx_path, data_only=True)
+        aws = awb.active
+        for row in aws.iter_rows(min_row=2, values_only=True):
+            if not row or not row[0]:
+                continue
+            s_num = str(row[0]).strip()
+            present_ids.add(s_num)
+            attendance_map[s_num] = {
+                'timestamp': row[2] if len(row) > 2 else '',
+                'photo_path': row[4] if len(row) > 4 else ''
+            }
+
+    red_fill = PatternFill(start_color='FFEFEF', end_color='FFEFEF', fill_type='solid')
+
+    # Split roster so absentees appear first
+    absent_list = []
+    present_list = []
+    for student in roster.to_dict(orient='records'):
+        s = str(student.get('s-number', '')).strip()
+        name = student.get('Name', '')
+        present = 'Yes' if s in present_ids else 'No'
+        ts = attendance_map.get(s, {}).get('timestamp', '')
+        photo = attendance_map.get(s, {}).get('photo_path', '')
+        record = { 's': s, 'name': name, 'present': present, 'ts': ts, 'photo': photo }
+        if present == 'No':
+            absent_list.append(record)
+        else:
+            present_list.append(record)
+
+    # set photo column width and default
+    ws.column_dimensions['E'].width = 22
+
+    for record in (absent_list + present_list):
+        s = record['s']
+        name = record['name']
+        present = record['present']
+        ts = record['ts']
+        photo = record['photo']
+
+        # Append row and embed photo into column E sized to the cell
+        ws.append([s, name, ts, present, ""])
+        row_idx = ws.max_row
+
+        if photo:
+            photo_path = PHOTOS_ROOT / photo
+            if photo_path.exists():
+                try:
+                    xl_img = XLImage(str(photo_path))
+                    # Resize image to fit into the cell (approx)
+                    # column width 22 -> approx 22*7 = 154 px
+                    xl_img.width = 154
+                    xl_img.height = 90
+                    cell_addr = f"E{row_idx}"
+                    ws.add_image(xl_img, cell_addr)
+                    ws.row_dimensions[row_idx].height = 70
+                except Exception:
+                    ws.cell(row=row_idx, column=5, value=photo)
+            else:
+                ws.cell(row=row_idx, column=5, value=photo)
+
+        # Highlight absentees (they are at top already)
+        if present == 'No':
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row_idx, column=col).fill = red_fill
+
+    return wb
+
+
+@app.route('/export/students')
+def export_students():
+    if not is_authed():
+        return redirect(url_for('history'))
+    # Serve the students.xlsx file for download
+    return send_from_directory(APP_DIR, ROSTER_PATH.name, as_attachment=True)
+
+
+@app.route('/export/attendance')
+def export_attendance():
+    if not is_authed():
+        return redirect(url_for('history'))
+    selected_date = request.args.get('date', get_today_str())
+    wb = _make_attendance_export(selected_date)
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return send_file(bio, as_attachment=True, download_name=f"attendance_{selected_date}.xlsx", mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+@app.route('/export/analytics')
+def export_analytics():
+    if not is_authed():
+        return redirect(url_for('history'))
+    # Generate analytics workbook (simple CSV-like sheet + bar chart)
+    # Collect dates
+    available_dates = []
+    for file in sorted(APP_DIR.glob("attendance_*.xlsx"), reverse=True):
+        date_str = file.stem.replace("attendance_", "")
+        available_dates.append(date_str)
+    roster = load_roster()
+    analytics = calculate_analytics(roster, available_dates)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Analytics'
+    ws.append(['Name', 'S-Number', 'Present Count', 'Absent Count', 'Attendance Rate'])
+    for s in analytics['students']:
+        ws.append([s['name'], s['s_number'], s['present_count'], s['absent_count'], s['attendance_rate']])
+
+    # Add a simple bar chart for present_count
+    chart = BarChart()
+    chart.title = 'Present Count per Student'
+    chart.y_axis.title = 'Present Count'
+    chart.x_axis.title = 'Student'
+    data = Reference(ws, min_col=3, min_row=1, max_row=ws.max_row)
+    cats = Reference(ws, min_col=1, min_row=2, max_row=ws.max_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    ws.add_chart(chart, 'H2')
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return send_file(bio, as_attachment=True, download_name='analytics.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
 if __name__ == "__main__":
