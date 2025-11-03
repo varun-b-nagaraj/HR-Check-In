@@ -1033,7 +1033,7 @@ function updateHallPassButton() {
   }
 }
 
-// Show modal for hall pass checkout
+// Handle hall pass button click - either check out or check in
 hallPassBtn.addEventListener('click', async () => {
   const s_number = input.value.trim();
   if (!s_number) {
@@ -1046,30 +1046,40 @@ hallPassBtn.addEventListener('click', async () => {
     return;
   }
 
-  // Check if student already has an active pass
+  // Check if student has an active pass
   try {
-    const res = await fetch('/api/hall-pass/checkout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        class_id: currentClassId,
-        s_number: s_number,
-        reason: 'CHECKONLY'
-      })
-    });
+    const statusRes = await fetch(`/api/hall-pass/status/${currentClassId}`);
+    const passes = await statusRes.json();
+    const activePass = passes.find(p => p.s_number === s_number && (p.status === 'active' || p.status === 'overdue'));
 
-    const data = await res.json();
-    if (res.status === 400 && data.error === 'Student already has active hall pass') {
-      showErrorMessage("You already have an active hall pass.");
-      return;
+    if (activePass) {
+      // Student has active pass - check them in
+      const image_data_url = takeSnapshot();
+      const res = await fetch('/api/hall-pass/checkin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pass_id: activePass.id,
+          image_data_url: image_data_url
+        })
+      });
+
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.error || 'Check-in failed');
+      }
+
+      showCheckinMessage(activePass.name, true);
+      form.reset();
+      input.focus();
+    } else {
+      // No active pass - show checkout modal
+      hallPassModal.style.display = 'flex';
     }
   } catch (err) {
-    console.error('Error checking hall pass status:', err);
-    showErrorMessage("Failed to check hall pass status. Please try again.");
-    return;
+    console.error('Hall pass error:', err);
+    showErrorMessage(err.message || "Failed to process hall pass. Please try again.");
   }
-
-  hallPassModal.style.display = 'flex';
 });
 
 // Close modal when cancel clicked
@@ -1114,88 +1124,24 @@ hallPassForm.addEventListener('submit', async (e) => {
       return;
     }
 
-    currentHallPass = {
-      pass_id: data.pass_id,
-      checkout_time: new Date(),
-      student_name: data.student_name
-    };
-
-    // Show success message with check-in button
+    // Show success message
     msg.innerHTML = `
       <span class="checkmark">✓</span>
       <span class="greeting">Hall pass checked out!</span>
-      <span class="detail">Please check in when you return.</span>
-      <button onclick="handleHallPassReturn()" style="margin-top:1rem; width:auto; padding:0.5rem 1rem">
-        Return &amp; Check In
-      </button>
+      <span class="detail">${data.student_name} has been checked out.</span>
     `;
     msg.className = 'msg success show';
 
-    // Close modal and reset form
+    // Close modal and reset forms
     hallPassModal.style.display = 'none';
     hallPassForm.reset();
+    form.reset();
+    input.focus();
   } catch (err) {
     console.error('Hall pass checkout error:', err);
     showErrorMessage("Failed to check out hall pass. Please try again.");
   }
 });
-
-// Handle hall pass return
-async function handleHallPassReturn() {
-  if (!currentHallPass) {
-    showErrorMessage("No active hall pass found.");
-    return;
-  }
-
-  try {
-    const image_data_url = takeSnapshot();
-    
-    // Show notes input modal
-    const notes = prompt("Add any notes about the return (optional):");
-    
-    const res = await fetch('/api/hall-pass/checkin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        pass_id: currentHallPass.pass_id,
-        photo: image_data_url,
-        notes: notes || ''
-      })
-    });
-
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Check-in failed');
-    }
-
-    if (!res.ok) {
-      const error = await res.json();
-      throw new Error(error.error || 'Check-in failed');
-    }
-
-    // Show success message
-    msg.innerHTML = `
-      <span class="checkmark">✓</span>
-      <span class="greeting">Welcome back, ${currentHallPass.student_name}!</span>
-      <span class="detail">Your hall pass has been checked in.</span>
-    `;
-    msg.className = 'msg success show';
-    
-    // Clear hall pass state
-    currentHallPass = null;
-    
-    // Re-enable the main check-in button
-    submitBtn.disabled = false;
-    submitBtn.textContent = 'Check In';
-    // Reset form
-    form.reset();
-    hallPassForm.reset();
-
-  } catch (err) {
-    console.error('Hall pass check-in error:', err);
-    showErrorMessage(err.message || "Failed to check in hall pass. Please try again.");
-  }
-}
 
 // Update hall pass visibility when class changes
 const originalUpdateClassDisplay = updateClassDisplay;

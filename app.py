@@ -233,19 +233,8 @@ def record_hall_pass_checkout(class_id: str, s_number: str, photo_path: str,
     name = student.iloc[0]['Name']
     
     with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        
-        # Check for active passes within transaction
-        cur.execute("""
-            SELECT id FROM hall_passes 
-            WHERE class_id = ? AND s_number = ? AND status = 'active'
-            LIMIT 1
-        """, (class_id, s_number))
-        if cur.fetchone():
-            raise ValueError("Student already has an active hall pass")
-            
-        # Create new pass if no active ones found
+        # Create new pass
         cur.execute("""
             INSERT INTO hall_passes 
             (class_id, s_number, name, check_out_time, expected_duration, 
