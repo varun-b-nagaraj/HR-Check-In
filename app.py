@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -17,9 +18,11 @@ from openpyxl.styles import PatternFill, Font
 from openpyxl.chart import BarChart, Reference
 
 APP_DIR = Path(__file__).parent.resolve()
-ROSTER_PATH = APP_DIR / "students.xlsx"   # <-- your roster
+CONFIG_PATH = APP_DIR / "config.json"      # Class configuration
 PHOTOS_ROOT = APP_DIR / "photos"          # we now KEEP a copy for history page
 PHOTOS_ROOT.mkdir(exist_ok=True)
+DATA_DIR = APP_DIR / "data"               # Directory for class-specific data
+DATA_DIR.mkdir(exist_ok=True)
 
 # ---- Admin password + session secret
 ADMIN_PASSWORD = "abhiMora1!"             # <--- you set this
@@ -30,10 +33,50 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
 
-def load_roster():
-    if not ROSTER_PATH.exists():
-        raise FileNotFoundError("students.xlsx not found next to app.py")
-    df = pd.read_excel(ROSTER_PATH)
+def load_config():
+    """Load the class configuration"""
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError("config.json not found")
+    with open(CONFIG_PATH, 'r') as f:
+        return json.load(f)
+
+def get_class_config(class_id=None):
+    """Get configuration for a specific class or default class"""
+    config = load_config()
+    if class_id:
+        print(f"Looking for class config with id: {class_id}")
+        for class_config in config['classes']:
+            if class_config['id'] == class_id:
+                print(f"Found class config: {class_config}")
+                return class_config
+        print(f"No class config found for id: {class_id}, using default")
+    # Return default class config if no specific class found
+    return next((c for c in config['classes'] if c['id'] == config['defaultClass']), 
+                config['classes'][0] if config['classes'] else None)
+
+def get_roster_path(class_config):
+    """Get the roster file path for a specific class"""
+    path = DATA_DIR / class_config['studentsPath']
+    path.parent.mkdir(parents=True, exist_ok=True)  # Ensure parent directory exists
+    return path
+
+def load_roster(class_id=None):
+    """Load roster for a specific class"""
+    class_config = get_class_config(class_id)
+    if not class_config:
+        raise FileNotFoundError("No class configuration found")
+    print(f"Loading roster for class {class_id}, config: {class_config}")
+    
+    roster_path = get_roster_path(class_config)
+    print(f"Roster path: {roster_path}, exists: {roster_path.exists()}")
+    if not roster_path.exists():
+        # Create empty roster file if it doesn't exist
+        print(f"Creating new roster file at {roster_path}")
+        df = pd.DataFrame(columns=["Name", "s-number"])
+        df.to_excel(roster_path, index=False)
+        return df
+    
+    df = pd.read_excel(roster_path)
     cols = {c.lower().strip(): c for c in df.columns}
     name_col = cols.get("name") or cols.get("student") or "Name"
     snum_col = cols.get("s-number") or cols.get("s number") or "s-number"
@@ -48,8 +91,11 @@ def get_today_str():
     return datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
 
 
-def get_today_xlsx_path():
-    return APP_DIR / f"attendance_{get_today_str()}.xlsx"
+def get_today_xlsx_path(class_id=None):
+    class_prefix = f"{class_id}_" if class_id else ""
+    path = DATA_DIR / f"attendance_{class_prefix}{get_today_str()}.xlsx"
+    path.parent.mkdir(parents=True, exist_ok=True)  # Ensure parent directory exists
+    return path
 
 
 def ensure_workbook(path: Path):
@@ -184,6 +230,35 @@ def calculate_analytics(roster, available_dates):
     }
 
 
+@app.route("/config")
+def get_config():
+    """Return the class configuration to the frontend"""
+    try:
+        config = load_config()
+        return jsonify(config)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/verify_class_password", methods=["POST"])
+def verify_class_password():
+    """Verify the password for a specific class"""
+    payload = request.get_json(silent=True) or {}
+    class_id = payload.get("classId")
+    password = payload.get("password")
+
+    if not class_id or not password:
+        return jsonify({"ok": False, "error": "Missing classId or password"}), 400
+
+    try:
+        config = load_config()
+        class_config = next((c for c in config["classes"] if c["id"] == class_id), None)
+        if class_config and class_config["password"] == password:
+            return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": False}), 403
+
 @app.route("/", methods=["GET"])
 def index():
     return render_template("index.html")
@@ -194,23 +269,35 @@ def checkin():
     payload = request.get_json(force=True)
     s_number = str(payload.get("s_number", "")).strip()
     photo_data_url = payload.get("image_data_url")
+    class_id = payload.get("classId")
+    print(f"Check-in request for class_id: {class_id}, s_number: {s_number}")
 
     if not s_number:
         return jsonify({"ok": False, "error": "Missing s-number"}), 400
     if not photo_data_url or not photo_data_url.startswith("data:image/"):
         return jsonify({"ok": False, "error": "Missing or invalid photo"}), 400
 
-    # Lookup roster
-    roster = load_roster()
+    # Get class configuration
+    class_config = get_class_config(class_id)
+    if not class_config:
+        return jsonify({"ok": False, "error": "Invalid class configuration"}), 400
+
+    # Lookup roster for specific class
+    roster = load_roster(class_id)
+    print(f"Looking up s-number: '{s_number}' in roster with s-numbers: {roster['s-number'].tolist()}")
+    # Ensure s-number formats match exactly
+    roster["s-number"] = roster["s-number"].astype(str).str.strip()
+    s_number = str(s_number).strip()
+    print(f"Normalized s-number: '{s_number}' vs roster s-numbers: {roster['s-number'].tolist()}")
     match = roster.loc[roster["s-number"] == s_number]
     if match.empty:
-        return jsonify({"ok": False, "error": "S-number not found"}), 404
+        return jsonify({"ok": False, "error": "S-number not found in this class"}), 404
 
     full_name = match.iloc[0]["Name"]
     fname = first_name(full_name)
 
-    # Prepare workbook
-    xlsx_path = get_today_xlsx_path()
+    # Prepare workbook with class-specific path
+    xlsx_path = DATA_DIR / f"attendance_{class_config['id']}_{get_today_str()}.xlsx"
     wb, ws = ensure_workbook(xlsx_path)
 
     # Only first check-in counts today
@@ -226,7 +313,8 @@ def checkin():
     row_idx = ws.max_row
 
     # Embed photo, keep file, and write PhotoPath (col E)
-    web_path = save_and_embed_photo(ws, row_idx, photo_data_url, s_number)
+    photo_prefix = f"{class_config['photosPrefix']}_{s_number}"
+    web_path = save_and_embed_photo(ws, row_idx, photo_data_url, photo_prefix)
     ws.cell(row=row_idx, column=5, value=web_path)
 
     wb.save(xlsx_path)
@@ -253,24 +341,31 @@ def history():
     if not is_authed():
         return render_template("history_login.html")
 
-    # Get selected date from query param, default to today
+    # Get selected class and date from query params
+    class_id = request.args.get("classId")
     selected_date = request.args.get("date", get_today_str())
     
-    # Get all available dates (all attendance files)
+    # Get class configuration
+    class_config = get_class_config(class_id)
+    if not class_config:
+        return jsonify({"error": "Invalid class ID"}), 400
+
+    # Get all available dates for this class
     available_dates = []
-    for file in sorted(APP_DIR.glob("attendance_*.xlsx"), reverse=True):
-        date_str = file.stem.replace("attendance_", "")
+    pattern = f"attendance_{class_config['id']}_*.xlsx"
+    for file in sorted(DATA_DIR.glob(pattern), reverse=True):
+        date_str = file.stem.replace(f"attendance_{class_config['id']}_", "")
         available_dates.append(date_str)
     
     if not available_dates:
         available_dates = [get_today_str()]
 
-    # Load roster
-    roster = load_roster()
+    # Load class-specific roster
+    roster = load_roster(class_id)
     roster["s-number"] = roster["s-number"].astype(str)
 
     # Get data for selected date
-    xlsx_path = APP_DIR / f"attendance_{selected_date}.xlsx"
+    xlsx_path = DATA_DIR / f"attendance_{class_config['id']}_{selected_date}.xlsx"
     present = []
     present_ids = set()
 
@@ -300,13 +395,18 @@ def history():
     # Calculate analytics across all dates
     analytics = calculate_analytics(roster, available_dates)
 
+    # Load all class configurations for the dropdown
+    config = load_config()
+
     return render_template("history.html",
                            present=present,
                            absent=absent_df.to_dict(orient="records"),
                            selected_date=selected_date,
                            today=get_today_str(),
                            available_dates=available_dates,
-                           analytics=analytics)
+                           analytics=analytics,
+                           classes=config["classes"],
+                           current_class=class_config)
 
 
 @app.route("/logout")
@@ -340,15 +440,29 @@ def verify_password():
 def get_roster():
     if not is_authed():
         return jsonify({'ok': False, 'error': 'unauthorized'}), 403
-    df = load_roster()
-    return jsonify({'ok': True, 'students': df.to_dict(orient='records')})
-
+    
+    class_id = request.args.get('classId')
+    try:
+        df = load_roster(class_id)
+        return jsonify({'ok': True, 'students': df.to_dict(orient='records')})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/roster/add', methods=['POST'])
 def add_roster():
     if not is_authed():
         return jsonify({'ok': False, 'error': 'unauthorized'}), 403
+
     payload = request.get_json(force=True)
+    class_id = payload.get('classId')
+    
+    # Get class configuration
+    class_config = get_class_config(class_id)
+    if not class_config:
+        return jsonify({'ok': False, 'error': 'Invalid class ID'}), 400
+    
+    roster_path = get_roster_path(class_config)
+        
     # accept single or bulk
     entries = payload.get('entries') or []
     # entries may be a single dict
@@ -366,7 +480,12 @@ def add_roster():
         return jsonify({'ok': False, 'error': 'no entries provided'}), 400
 
     # Load existing roster
-    df = pd.read_excel(ROSTER_PATH)
+    try:
+        df = pd.read_excel(roster_path)
+    except FileNotFoundError:
+        # Create new roster file if it doesn't exist
+        df = pd.DataFrame(columns=['Name', 's-number'])
+
     # Normalize column names
     cols = {c.lower().strip(): c for c in df.columns}
     name_col = cols.get('name') or cols.get('student') or 'Name'
@@ -389,17 +508,18 @@ def add_roster():
         df = df.append({name_col: n, snum_col: s}, ignore_index=True)
         added.append({'Name': n, 's-number': s})
 
-    # Save back to students.xlsx
-    df.to_excel(ROSTER_PATH, index=False)
+    # Save back to class-specific roster
+    df.to_excel(roster_path, index=False)
 
     return jsonify({'ok': True, 'added': added})
 
 
 # ---------- EXPORT endpoints (admin only) ----------
-def _make_attendance_export(selected_date: str):
+def _make_attendance_export(selected_date: str, class_id: str = None):
     # Build a workbook combining roster and attendance for selected_date
-    roster = load_roster()
-    xlsx_path = APP_DIR / f"attendance_{selected_date}.xlsx"
+    class_config = get_class_config(class_id)
+    roster = load_roster(class_id)
+    xlsx_path = DATA_DIR / f"attendance_{class_config['id']}_{selected_date}.xlsx"
 
     wb = Workbook()
     ws = wb.active
@@ -483,20 +603,34 @@ def _make_attendance_export(selected_date: str):
 def export_students():
     if not is_authed():
         return redirect(url_for('history'))
-    # Serve the students.xlsx file for download
-    return send_from_directory(APP_DIR, ROSTER_PATH.name, as_attachment=True)
+    
+    class_id = request.args.get('classId')
+    class_config = get_class_config(class_id)
+    if not class_config:
+        return jsonify({'error': 'Invalid class ID'}), 400
+        
+    roster_path = get_roster_path(class_config)
+    return send_file(roster_path, as_attachment=True, 
+                    download_name=f"students_{class_config['id']}.xlsx")
 
 
 @app.route('/export/attendance')
 def export_attendance():
     if not is_authed():
         return redirect(url_for('history'))
+    
+    class_id = request.args.get('classId')
     selected_date = request.args.get('date', get_today_str())
-    wb = _make_attendance_export(selected_date)
+    
+    wb = _make_attendance_export(selected_date, class_id)
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return send_file(bio, as_attachment=True, download_name=f"attendance_{selected_date}.xlsx", mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    
+    class_suffix = f"_{class_id}" if class_id else ""
+    return send_file(bio, as_attachment=True, 
+                    download_name=f"attendance{class_suffix}_{selected_date}.xlsx",
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
 @app.route('/export/analytics')
@@ -506,7 +640,7 @@ def export_analytics():
     # Generate analytics workbook (simple CSV-like sheet + bar chart)
     # Collect dates
     available_dates = []
-    for file in sorted(APP_DIR.glob("attendance_*.xlsx"), reverse=True):
+    for file in sorted(DATA_DIR.glob("attendance_*.xlsx"), reverse=True):
         date_str = file.stem.replace("attendance_", "")
         available_dates.append(date_str)
     roster = load_roster()
@@ -538,4 +672,4 @@ def export_analytics():
 
 if __name__ == "__main__":
     # For Chromebook local testing
-    app.run(host="0.0.0.0", port=5005, debug=True)
+    app.run(host="0.0.0.0", port=5006, debug=True)

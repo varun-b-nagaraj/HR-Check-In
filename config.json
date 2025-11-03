@@ -1,0 +1,26 @@
+{
+    "classes": [
+        {
+            "id": "bell_1st",
+            "name": "Mrs. Bell 1st Period",
+            "password": "bell1st2025",
+            "studentsPath": "bell_1st_students.xlsx",
+            "photosPrefix": "bell_1st"
+        },
+        {
+            "id": "bell_2nd",
+            "name": "Mrs. Bell 2nd Period",
+            "password": "bell2nd2025",
+            "studentsPath": "bell_2nd_students.xlsx",
+            "photosPrefix": "bell_2nd"
+        },
+        {
+            "id": "coop_morning",
+            "name": "Co-OP Morning Period",
+            "password": "coopam2025",
+            "studentsPath": "coop_morning_students.xlsx",
+            "photosPrefix": "coop_morning"
+        }
+    ],
+    "defaultClass": "bell_1st"
+}

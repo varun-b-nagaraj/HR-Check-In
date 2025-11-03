@@ -27,9 +27,15 @@
       right: 2rem;
       top: 2rem;
       z-index: 1000;
+      display: flex;
+      gap: 1rem;
     }
 
-    .topbar a {
+    .settings-container {
+      position: relative;
+    }
+
+    .topbar a, .settings-btn {
       display: flex;
       align-items: center;
       justify-content: center;
@@ -41,11 +47,71 @@
       font-size: 1.5rem;
       box-shadow: 0 4px 12px rgba(139, 33, 33, 0.1);
       transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      cursor: pointer;
     }
 
-    .topbar a:hover {
+    .topbar a:hover, .settings-btn:hover {
       transform: translateY(-2px) scale(1.05);
       box-shadow: 0 6px 20px rgba(139, 33, 33, 0.2);
+    }
+
+    .settings-dropdown {
+      position: absolute;
+      top: 100%;
+      right: 0;
+      margin-top: 0.5rem;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+      width: 220px;
+      display: none;
+      overflow: hidden;
+    }
+
+    .settings-dropdown.show {
+      display: block;
+      animation: dropdownAppear 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    @keyframes dropdownAppear {
+      from {
+        opacity: 0;
+        transform: translateY(-10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .settings-header {
+      padding: 1rem;
+      background: #8B2121;
+      color: white;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+
+    .class-options {
+      padding: 0.5rem 0;
+    }
+
+    .class-option {
+      padding: 0.75rem 1rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      font-size: 0.95rem;
+      color: #333;
+    }
+
+    .class-option:hover {
+      background: #f5f5f5;
+    }
+
+    .class-option.active {
+      background: #fef2f2;
+      color: #8B2121;
+      font-weight: 600;
     }
 
     .topbar a:active {
@@ -366,7 +432,16 @@
 </head>
 <body>
   <div class="topbar">
-    <a href="/history" title="History / Admin" aria-label="Settings">⚙️</a>
+    <div class="settings-container">
+      <a href="#" id="settingsBtn" title="Settings" aria-label="Settings" class="settings-btn">⚙️</a>
+      <div id="settingsDropdown" class="settings-dropdown">
+        <div class="settings-header">Select Class Period</div>
+        <div id="classOptions" class="class-options">
+          <!-- Options will be populated from config.json -->
+        </div>
+      </div>
+    </div>
+    <a href="/history" title="History / Admin" class="history-btn">📋</a>
   </div>
 
   <!-- Small live preview in top-left so users know they're being recorded -->
@@ -505,6 +580,13 @@ form.addEventListener("submit", async (e) => {
     return;
   }
 
+  if (!currentClassId) {
+    showErrorMessage("Please select a class period first.");
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Check In';
+    return;
+  }
+
   // Auto capture; no preview
   const image_data_url = takeSnapshot();
 
@@ -512,7 +594,11 @@ form.addEventListener("submit", async (e) => {
     const res = await fetch("/checkin", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ s_number, image_data_url })
+      body: JSON.stringify({ 
+        s_number, 
+        image_data_url,
+        classId: currentClassId 
+      })
     });
     const data = await res.json();
 
@@ -670,4 +756,129 @@ previewToggle.addEventListener('change', (e) => {
   // else attempt to start camera quietly
   await startCamera();
 })();
+
+// Class selection functionality
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsDropdown = document.getElementById('settingsDropdown');
+const classOptions = document.getElementById('classOptions');
+let currentClassId = localStorage.getItem('selectedClassId');
+
+// Load class config and setup dropdown
+async function loadClassConfig() {
+  try {
+    const response = await fetch('/config');
+    const config = await response.json();
+    
+    // Save config for later use
+    window.classConfig = config;
+    
+    // Create class options
+    classOptions.innerHTML = config.classes.map(c => `
+      <div class="class-option ${c.id === currentClassId ? 'active' : ''}" 
+           data-class-id="${c.id}">
+        ${c.name}
+      </div>
+    `).join('');
+
+    // If no class is selected, use default
+    if (!currentClassId && config.defaultClass) {
+      currentClassId = config.defaultClass;
+      localStorage.setItem('selectedClassId', currentClassId);
+    }
+
+    // Update page title and header
+    updateClassDisplay();
+  } catch (err) {
+    console.error('Failed to load class config:', err);
+  }
+}
+
+// Update the display when class changes
+function updateClassDisplay() {
+  if (!window.classConfig || !currentClassId) return;
+  
+  const selectedClass = window.classConfig.classes.find(c => c.id === currentClassId);
+  if (selectedClass) {
+    document.title = `${selectedClass.name} - Check-In`;
+    document.querySelector('h2').textContent = `${selectedClass.name} Check-In`;
+  }
+}
+
+// Toggle dropdown on settings click
+settingsBtn.addEventListener('click', (e) => {
+  e.preventDefault();
+  settingsDropdown.classList.toggle('show');
+  // Close dropdown when clicking outside
+  if (settingsDropdown.classList.contains('show')) {
+    document.addEventListener('click', closeDropdownOnClickOutside);
+  }
+});
+
+// Close dropdown when clicking outside
+function closeDropdownOnClickOutside(e) {
+  if (!settingsDropdown.contains(e.target) && !settingsBtn.contains(e.target)) {
+    settingsDropdown.classList.remove('show');
+    document.removeEventListener('click', closeDropdownOnClickOutside);
+  }
+}
+
+// Handle class selection
+classOptions.addEventListener('click', async (e) => {
+  const option = e.target.closest('.class-option');
+  if (!option) return;
+
+  const classId = option.dataset.classId;
+  
+  // If different class selected, verify with password
+  if (classId !== currentClassId) {
+    const password = await promptClassPassword();
+    if (!password) return;
+
+    try {
+      const res = await fetch('/verify_class_password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          classId,
+          password 
+        })
+      });
+
+      const data = await res.json();
+      if (!data.ok) {
+        alert('Incorrect password');
+        return;
+      }
+
+      // Update selection
+      currentClassId = classId;
+      localStorage.setItem('selectedClassId', classId);
+      
+      // Update UI
+      document.querySelectorAll('.class-option').forEach(opt => {
+        opt.classList.toggle('active', opt.dataset.classId === classId);
+      });
+      
+      updateClassDisplay();
+      settingsDropdown.classList.remove('show');
+      
+      // Refresh the page to reset the form
+      window.location.reload();
+    } catch (err) {
+      console.error('Failed to verify class password:', err);
+      alert('Failed to change class. Please try again.');
+    }
+  }
+});
+
+// Prompt for class password
+function promptClassPassword() {
+  return new Promise(resolve => {
+    const password = prompt('Enter the class password:');
+    resolve(password);
+  });
+}
+
+// Load class config on page load
+loadClassConfig();
   </script>
