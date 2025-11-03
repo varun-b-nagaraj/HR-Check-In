@@ -832,16 +832,25 @@ def hall_pass_checkout():
             'pass': dict(active_pass)
         }), 400
 
-    # Take checkout photo
+    # Save checkout photo from data URL
     photo_path = None
-    day_dir = PHOTOS_ROOT / "hall_pass"
-    day_dir.mkdir(parents=True, exist_ok=True)
-    
-    if camera_is_initialized():
+    if image_data_url and image_data_url.startswith('data:image/'):
+        day_dir = PHOTOS_ROOT / "hall_pass"
+        day_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract image data
+        header, b64data = image_data_url.split(",", 1)
+        binary = base64.b64decode(b64data)
+        
+        # Save the image
         timestamp = datetime.now(ZoneInfo("America/Chicago")).strftime('%Y-%m-%d_%H-%M-%S')
-        photo_path = str(PHOTOS_ROOT / "hall_pass" / f"checkout_{s_number}_{timestamp}.jpg")
-        if capture_photo(photo_path):
-            photo_path = f"hall_pass/checkout_{s_number}_{timestamp}.jpg"
+        photo_filename = f"checkout_{s_number}_{timestamp}.jpg"
+        photo_file_path = day_dir / photo_filename
+        
+        with open(photo_file_path, 'wb') as f:
+            f.write(binary)
+            
+        photo_path = f"hall_pass/{photo_filename}"
 
     try:
         # Record checkout
@@ -863,6 +872,7 @@ def hall_pass_checkin():
     """Endpoint to check in a hall pass"""
     data = request.get_json()
     pass_id = data.get('pass_id')
+    image_data_url = data.get('image_data_url')
     notes = data.get('notes', '')
 
     if not pass_id:
@@ -882,16 +892,25 @@ def hall_pass_checkin():
 
         s_number = hall_pass['s_number']
 
-    # Take checkin photo 
+    # Save checkin photo from data URL
     photo_path = None
-    day_dir = PHOTOS_ROOT / "hall_pass"
-    day_dir.mkdir(parents=True, exist_ok=True)
-
-    if camera_is_initialized():
+    if image_data_url and image_data_url.startswith('data:image/'):
+        day_dir = PHOTOS_ROOT / "hall_pass"
+        day_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract image data
+        header, b64data = image_data_url.split(",", 1)
+        binary = base64.b64decode(b64data)
+        
+        # Save the image
         timestamp = datetime.now(ZoneInfo("America/Chicago")).strftime('%Y-%m-%d_%H-%M-%S')
-        photo_path = str(PHOTOS_ROOT / "hall_pass" / f"checkin_{s_number}_{timestamp}.jpg")
-        if capture_photo(photo_path):
-            photo_path = f"hall_pass/checkin_{s_number}_{timestamp}.jpg"
+        photo_filename = f"checkin_{s_number}_{timestamp}.jpg"
+        photo_file_path = day_dir / photo_filename
+        
+        with open(photo_file_path, 'wb') as f:
+            f.write(binary)
+            
+        photo_path = f"hall_pass/{photo_filename}"
 
     try:
         # Record checkin

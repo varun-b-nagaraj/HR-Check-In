@@ -1055,6 +1055,10 @@ hallPassBtn.addEventListener('click', async () => {
     if (activePass) {
       // Student has active pass - check them in
       const image_data_url = takeSnapshot();
+      if (!image_data_url || !image_data_url.startsWith('data:image/')) {
+        showErrorMessage("Failed to capture photo. Please check camera permissions.");
+        return;
+      }
       const res = await fetch('/api/hall-pass/checkin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1103,8 +1107,12 @@ hallPassForm.addEventListener('submit', async (e) => {
   const duration = parseInt(formData.get('duration'), 10);
 
   try {
-    // Take photo and check out
+    // Take photo for checkout the same way we do for check-ins
     const image_data_url = takeSnapshot();
+    if (!image_data_url || !image_data_url.startsWith('data:image/')) {
+      showErrorMessage("Failed to capture photo. Please check camera permissions.");
+      return;
+    }
     
     const res = await fetch('/api/hall-pass/checkout', {
       method: 'POST',
