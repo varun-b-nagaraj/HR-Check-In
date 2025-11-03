@@ -256,8 +256,12 @@ def record_hall_pass_checkin(pass_id: int, photo_path: str, notes: str):
             raise ValueError("Hall pass not found")
             
         # Calculate duration in minutes between checkout and now
+        # Convert both times to US Central time for consistent calculation
         checkout_time = datetime.strptime(row['check_out_time'], '%Y-%m-%d %H:%M:%S')
-        now = datetime.now()
+        checkout_time = checkout_time.replace(tzinfo=ZoneInfo("UTC"))
+        checkout_time = checkout_time.astimezone(ZoneInfo("America/Chicago"))
+        
+        now = datetime.now(ZoneInfo("America/Chicago"))
         actual_duration = int((now - checkout_time).total_seconds() / 60)
         
         cur.execute("""

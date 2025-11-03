@@ -856,7 +856,8 @@
 
     // Format duration
     function formatDuration(minutes) {
-      if (!minutes) return 'N/A';
+      if (minutes === null || minutes === undefined) return 'N/A';
+      if (minutes === 0) return '0m';
       const hours = Math.floor(minutes / 60);
       const mins = minutes % 60;
       if (hours > 0) {
@@ -867,7 +868,7 @@
 
     // Get duration class based on length
     function getDurationClass(minutes) {
-      if (!minutes) return 'duration-normal';
+      if (minutes === null || minutes === undefined) return 'duration-normal';
       if (minutes > 30) return 'duration-overdue';
       if (minutes > 15) return 'duration-long';
       return 'duration-normal';
