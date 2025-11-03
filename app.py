@@ -2,7 +2,8 @@ import base64
 import io
 import json
 import os
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -16,6 +17,7 @@ from PIL import Image
 from zoneinfo import ZoneInfo
 from openpyxl.styles import PatternFill, Font
 from openpyxl.chart import BarChart, Reference
+import cv2
 
 APP_DIR = Path(__file__).parent.resolve()
 CONFIG_PATH = APP_DIR / "config.json"      # Class configuration
@@ -24,6 +26,14 @@ PHOTOS_ROOT.mkdir(exist_ok=True)
 DATA_DIR = APP_DIR / "data"               # Directory for class-specific data
 DATA_DIR.mkdir(exist_ok=True)
 
+DB_PATH = DATA_DIR / "attendance.db"     # SQLite database for hall passes
+
+def init_db():
+    """Initialize the SQLite database with hall pass tracking table"""
+    with sqlite3.connect(DB_PATH) as conn:
+        with open(APP_DIR / "migrations/create_hall_pass_table.sql") as f:
+            conn.executescript(f.read())
+
 # ---- Admin password + session secret
 ADMIN_PASSWORD = "abhiMora1!"             # <--- you set this
 SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "change-me-please")
@@ -31,6 +41,45 @@ SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "change-me-please")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
+# Initialize database
+init_db()
+
+# Initialize camera
+cap = None
+
+def init_camera():
+    """Initialize the camera"""
+    global cap
+    cap = cv2.VideoCapture(0)
+    return cap is not None
+
+def camera_is_initialized():
+    """Check if camera is initialized"""
+    global cap
+    return cap is not None and cap.isOpened()
+
+def capture_photo(photo_path):
+    """Capture a photo from the camera"""
+    global cap
+    if not camera_is_initialized():
+        return False
+
+    # Create directory if it doesn't exist
+    photo_dir = Path(photo_path).parent
+    photo_dir.mkdir(parents=True, exist_ok=True)
+
+    ret, frame = cap.read()
+    if ret:
+        cv2.imwrite(str(photo_path), frame)
+        return True
+    return False
+
+try:
+    init_camera()
+except Exception as e:
+    print(f"Failed to initialize camera: {e}")
+    print("Running without camera support")
 
 
 def load_config():
@@ -156,6 +205,80 @@ def save_and_embed_photo(ws, row_idx: int, data_url: str, s_number: str):
     web_path = f"{get_today_str()}/{filename}"  # served via /photos/<path>
     return web_path
 
+
+def get_active_hall_pass(class_id: str, s_number: str):
+    """Get active hall pass for a student if any exists"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        # Also get student name from roster for the response
+        cur.execute("""
+            SELECT h.*, 
+                   STRFTIME('%Y-%m-%d %H:%M:%S', h.check_out_time) as formatted_check_out_time,
+                   STRFTIME('%Y-%m-%d %H:%M:%S', h.check_in_time) as formatted_check_in_time
+            FROM hall_passes h
+            WHERE h.class_id = ? AND h.s_number = ? AND h.status = 'active'
+            ORDER BY h.check_out_time DESC LIMIT 1
+        """, (class_id, s_number))
+        return cur.fetchone()
+
+def record_hall_pass_checkout(class_id: str, s_number: str, photo_path: str, 
+                            reason: str, duration: int):
+    """Record a new hall pass checkout"""
+    # First get student name from roster
+    roster = load_roster(class_id)
+    student = roster[roster['s-number'].astype(str).str.strip() == str(s_number).strip()]
+    if student.empty:
+        raise ValueError("Student not found in roster")
+    name = student.iloc[0]['Name']
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO hall_passes 
+            (class_id, s_number, name, check_out_time, expected_duration, 
+             check_out_photo, check_out_reason, status)
+            VALUES (?, ?, ?, datetime('now'), ?, ?, ?, 'active')
+        """, (class_id, s_number, name, duration, photo_path, reason))
+        return cur.lastrowid
+
+def record_hall_pass_checkin(pass_id: int, photo_path: str, notes: str):
+    """Record a hall pass check-in"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        
+        # First get checkout time
+        cur.execute("SELECT check_out_time FROM hall_passes WHERE id = ?", (pass_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("Hall pass not found")
+            
+        # Calculate duration in minutes between checkout and now
+        checkout_time = datetime.strptime(row['check_out_time'], '%Y-%m-%d %H:%M:%S')
+        now = datetime.now()
+        actual_duration = int((now - checkout_time).total_seconds() / 60)
+        
+        cur.execute("""
+            UPDATE hall_passes 
+            SET check_in_time = datetime('now'),
+                check_in_photo = ?,
+                check_in_notes = ?,
+                actual_duration = ?,
+                status = 'completed'
+            WHERE id = ?
+        """, (photo_path, notes, actual_duration, pass_id))
+
+def update_overdue_passes():
+    """Update status of overdue hall passes"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE hall_passes 
+            SET status = 'overdue'
+            WHERE status = 'active'
+            AND datetime('now') > datetime(check_out_time, '+' || expected_duration || ' minutes')
+        """)
 
 def calculate_analytics(roster, available_dates):
     """Calculate attendance analytics across all sessions"""
@@ -668,6 +791,277 @@ def export_analytics():
     wb.save(bio)
     bio.seek(0)
     return send_file(bio, as_attachment=True, download_name='analytics.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+# ---------- HALL PASS endpoints ----------
+@app.route('/api/hall-pass/checkout', methods=['POST'])
+def hall_pass_checkout():
+    """Endpoint to check out a hall pass"""
+    data = request.get_json()
+    class_id = data.get('class_id')
+    s_number = data.get('s_number') 
+    reason = data.get('reason')
+    duration = data.get('duration', 10)  # Default 10 minutes
+
+    # Validate input
+    if not all([class_id, s_number]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    # Load roster to validate student
+    try:
+        roster = load_roster(class_id)
+        student = roster[roster['s-number'].astype(str).str.strip() == str(s_number).strip()]
+        if student.empty:
+            return jsonify({'error': 'Student not found in roster'}), 404
+        student_name = student.iloc[0]['Name']
+    except Exception as e:
+        print(f"Error loading roster: {e}")
+        return jsonify({'error': 'Error validating student'}), 500
+
+    # Check if student already has active pass
+    active_pass = get_active_hall_pass(class_id, s_number)
+    if active_pass:
+        return jsonify({
+            'error': 'Student already has active hall pass',
+            'pass': dict(active_pass)
+        }), 400
+
+    # Take checkout photo
+    photo_path = None
+    day_dir = PHOTOS_ROOT / "hall_pass"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    
+    if camera_is_initialized():
+        timestamp = datetime.now(ZoneInfo("America/Chicago")).strftime('%Y-%m-%d_%H-%M-%S')
+        photo_path = str(PHOTOS_ROOT / "hall_pass" / f"checkout_{s_number}_{timestamp}.jpg")
+        if capture_photo(photo_path):
+            photo_path = f"hall_pass/checkout_{s_number}_{timestamp}.jpg"
+
+    try:
+        # Record checkout
+        pass_id = record_hall_pass_checkout(
+            class_id, s_number, photo_path, reason, duration
+        )
+
+        return jsonify({
+            'pass_id': pass_id,
+            'photo_path': photo_path,
+            'student_name': student_name
+        })
+    except Exception as e:
+        print(f"Error recording hall pass checkout: {e}")
+        return jsonify({'error': 'Failed to record hall pass checkout'}), 500
+
+@app.route('/api/hall-pass/checkin', methods=['POST'])
+def hall_pass_checkin():
+    """Endpoint to check in a hall pass"""
+    data = request.get_json()
+    pass_id = data.get('pass_id')
+    notes = data.get('notes', '')
+
+    if not pass_id:
+        return jsonify({'error': 'Missing pass ID'}), 400
+
+    # Get the current pass to get student info for the photo
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM hall_passes WHERE id = ?", (pass_id,))
+        hall_pass = cur.fetchone()
+        
+        if not hall_pass:
+            return jsonify({'error': 'Hall pass not found'}), 404
+        if hall_pass['status'] != 'active':
+            return jsonify({'error': 'Hall pass is not active'}), 400
+
+        s_number = hall_pass['s_number']
+
+    # Take checkin photo 
+    photo_path = None
+    day_dir = PHOTOS_ROOT / "hall_pass"
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    if camera_is_initialized():
+        timestamp = datetime.now(ZoneInfo("America/Chicago")).strftime('%Y-%m-%d_%H-%M-%S')
+        photo_path = str(PHOTOS_ROOT / "hall_pass" / f"checkin_{s_number}_{timestamp}.jpg")
+        if capture_photo(photo_path):
+            photo_path = f"hall_pass/checkin_{s_number}_{timestamp}.jpg"
+
+    try:
+        # Record checkin
+        record_hall_pass_checkin(pass_id, photo_path, notes)
+        return jsonify({
+            'status': 'success',
+            'photo_path': photo_path
+        })
+    except Exception as e:
+        print(f"Error recording hall pass check-in: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/hall-pass/status/<class_id>')
+def hall_pass_status(class_id):
+    """Get status of all active hall passes for a class"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        
+        # Update any overdue passes first
+        update_overdue_passes()
+        
+        # Get active and overdue passes
+        cur.execute("""
+            SELECT * FROM hall_passes 
+            WHERE class_id = ? 
+            AND status IN ('active', 'overdue')
+            ORDER BY check_out_time DESC
+        """, (class_id,))
+        passes = [dict(row) for row in cur.fetchall()]
+        
+        return jsonify(passes)
+
+@app.route('/api/hall-pass/history')
+def hall_pass_history():
+    """Get hall pass history filtered by class and date"""
+    if not is_authed():
+        return jsonify({'error': 'Unauthorized'}), 403
+        
+    class_id = request.args.get('classId')
+    date = request.args.get('date')
+    
+    if not class_id:
+        return jsonify({'error': 'Missing class ID'}), 400
+        
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        
+        if date:
+            # Get passes for specific date
+            cur.execute("""
+                SELECT *, 
+                    strftime('%s', check_in_time) - strftime('%s', check_out_time) as duration_seconds
+                FROM hall_passes 
+                WHERE class_id = ? 
+                AND date(check_out_time) = ?
+                ORDER BY check_out_time DESC
+            """, (class_id, date))
+        else:
+            # Get all passes
+            cur.execute("""
+                SELECT *,
+                    strftime('%s', check_in_time) - strftime('%s', check_out_time) as duration_seconds
+                FROM hall_passes 
+                WHERE class_id = ?
+                ORDER BY check_out_time DESC
+            """, (class_id,))
+            
+        passes = []
+        for row in cur.fetchall():
+            pass_data = dict(row)
+            # Calculate duration in minutes for completed passes
+            if pass_data['check_in_time']:
+                duration_secs = pass_data.get('duration_seconds')
+                if duration_secs:
+                    pass_data['actual_duration_mins'] = int(int(duration_secs) / 60)
+            passes.append(pass_data)
+            
+        return jsonify(passes)
+
+@app.route('/api/hall-pass/export')
+def export_hall_passes():
+    """Export hall pass data to Excel"""
+    if not is_authed():
+        return jsonify({'error': 'Unauthorized'}), 403
+        
+    class_id = request.args.get('classId')
+    date = request.args.get('date')
+    
+    if not class_id:
+        return jsonify({'error': 'Missing class ID'}), 400
+        
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Hall Pass Log'
+    
+    # Headers
+    headers = ['Student ID', 'Name', 'Check Out Time', 'Check In Time', 
+              'Duration (min)', 'Reason', 'Notes', 'Status']
+    ws.append(headers)
+    
+    # Style header row
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        
+        if date:
+            cur.execute("""
+                SELECT *,
+                    CASE 
+                        WHEN check_in_time IS NOT NULL 
+                        THEN actual_duration
+                        ELSE NULL 
+                    END as duration_mins
+                FROM hall_passes 
+                WHERE class_id = ? 
+                AND date(check_out_time) = ?
+                ORDER BY check_out_time DESC
+            """, (class_id, date))
+        else:
+            cur.execute("""
+                SELECT *,
+                    CASE 
+                        WHEN check_in_time IS NOT NULL 
+                        THEN actual_duration
+                        ELSE NULL 
+                    END as duration_mins
+                FROM hall_passes 
+                WHERE class_id = ?
+                ORDER BY check_out_time DESC
+            """, (class_id,))
+            
+        for row in cur.fetchall():
+            ws.append([
+                row['s_number'],
+                row['name'],
+                row['check_out_time'],
+                row['check_in_time'] or 'Not returned',
+                row['duration_mins'] or 'N/A',
+                row['check_out_reason'],
+                row['check_in_notes'] or '',
+                row['status']
+            ])
+            
+    # Adjust column widths
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+            adjusted_width = (max_length + 2)
+            ws.column_dimensions[column].width = adjusted_width
+            
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    
+    filename = f'hall_pass_log_{class_id}'
+    if date:
+        filename += f'_{date}'
+    filename += '.xlsx'
+    
+    return send_file(
+        bio,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename
+    )
 
 
 if __name__ == "__main__":

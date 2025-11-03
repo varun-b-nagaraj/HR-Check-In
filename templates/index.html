@@ -12,6 +12,107 @@
       box-sizing: border-box;
     }
 
+    /* Hall Pass Modal Styles */
+    .hall-pass-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+      z-index: 1300;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+
+    .hall-pass-content {
+      width: 100%;
+      max-width: 480px;
+      background: white;
+      border-radius: 16px;
+      padding: 1.5rem;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+    }
+
+    .hall-pass-header {
+      color: #8B2121;
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+    }
+
+    .hall-pass-form {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .hall-pass-field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .hall-pass-field label {
+      font-weight: 600;
+      color: #333;
+    }
+
+    .hall-pass-field textarea {
+      padding: 0.75rem;
+      border: 2px solid #e5e5e5;
+      border-radius: 8px;
+      font-size: 1rem;
+      resize: vertical;
+      min-height: 80px;
+    }
+
+    .hall-pass-field textarea:focus {
+      border-color: #8B2121;
+      outline: none;
+      box-shadow: 0 0 0 4px rgba(139, 33, 33, 0.1);
+    }
+
+    .hall-pass-duration {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .hall-pass-duration input[type="number"] {
+      width: 80px;
+      padding: 0.5rem;
+      border: 2px solid #e5e5e5;
+      border-radius: 8px;
+      font-size: 1rem;
+    }
+
+    .hall-pass-duration input[type="number"]:focus {
+      border-color: #8B2121;
+      outline: none;
+      box-shadow: 0 0 0 4px rgba(139, 33, 33, 0.1);
+    }
+
+    .hall-pass-buttons {
+      display: flex;
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    .hall-pass-buttons button {
+      flex: 1;
+    }
+
+    .hall-pass-buttons button.cancel {
+      background: #f3f4f6;
+      color: #374151;
+      box-shadow: none;
+    }
+
+    .hall-pass-buttons button.cancel:hover {
+      background: #e5e7eb;
+      transform: none;
+    }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
       background: linear-gradient(135deg, #ffffff 0%, #f8f8f8 100%);
@@ -473,9 +574,33 @@
         />
       </div>
       <button type="submit" id="submitBtn">Check In</button>
+      <button type="button" id="hallPassBtn" style="margin-top: 1rem; background: #4B5563;">Hall Pass</button>
     </form>
     
     <div class="msg" id="msg"></div>
+  </div>
+
+  <!-- Hall Pass Modal -->
+  <div id="hallPassModal" class="hall-pass-modal" role="dialog" aria-modal="true">
+    <div class="hall-pass-content">
+      <h3 class="hall-pass-header">Hall Pass</h3>
+      <form id="hallPassForm" class="hall-pass-form">
+        <div class="hall-pass-field">
+          <label for="hallPassReason">Reason for leaving</label>
+          <textarea id="hallPassReason" name="reason" required></textarea>
+        </div>
+        <div class="hall-pass-field">
+          <div class="hall-pass-duration">
+            <label for="hallPassDuration">Duration (minutes):</label>
+            <input type="number" id="hallPassDuration" name="duration" min="1" max="30" value="10" required>
+          </div>
+        </div>
+        <div class="hall-pass-buttons">
+          <button type="button" class="cancel" id="hallPassCancel">Cancel</button>
+          <button type="submit">Check Out</button>
+        </div>
+      </form>
+    </div>
   </div>
 
   <!-- Password modal (hidden by default) -->
@@ -526,12 +651,20 @@ function takeSnapshot() {
 }
 
 // Helper functions for styled messages
-function showCheckinMessage(firstName) {
-  msg.innerHTML = `
-    <span class="checkmark">✓</span>
-    <span class="greeting">Welcome, ${firstName}!</span>
-    <span class="detail">You've been checked in successfully.</span>
-  `;
+function showCheckinMessage(firstName, isHallPassReturn = false) {
+  if (isHallPassReturn) {
+    msg.innerHTML = `
+      <span class="checkmark">✓</span>
+      <span class="greeting">Welcome back, ${firstName}!</span>
+      <span class="detail">Your hall pass has been checked in.</span>
+    `;
+  } else {
+    msg.innerHTML = `
+      <span class="checkmark">✓</span>
+      <span class="greeting">Welcome, ${firstName}!</span>
+      <span class="detail">You've been checked in successfully.</span>
+    `;
+  }
   msg.className = 'msg success show';
 }
 
@@ -881,4 +1014,193 @@ function promptClassPassword() {
 
 // Load class config on page load
 loadClassConfig();
+
+// ---------------- Hall Pass Functionality ----------------
+const hallPassBtn = document.getElementById('hallPassBtn');
+const hallPassModal = document.getElementById('hallPassModal');
+const hallPassForm = document.getElementById('hallPassForm');
+const hallPassCancel = document.getElementById('hallPassCancel');
+let currentHallPass = null;
+
+// Show/hide hall pass button based on class configuration
+function updateHallPassButton() {
+  if (!window.classConfig || !currentClassId) return;
+  const selectedClass = window.classConfig.classes.find(c => c.id === currentClassId);
+  if (selectedClass && selectedClass.checkInType === 'hall_pass') {
+    hallPassBtn.style.display = 'block';
+  } else {
+    hallPassBtn.style.display = 'none';
+  }
+}
+
+// Show modal for hall pass checkout
+hallPassBtn.addEventListener('click', async () => {
+  const s_number = input.value.trim();
+  if (!s_number) {
+    showErrorMessage("Please enter your s-number first.");
+    return;
+  }
+
+  if (!currentClassId) {
+    showErrorMessage("Please select a class period first.");
+    return;
+  }
+
+  // Check if student already has an active pass
+  try {
+    const res = await fetch('/api/hall-pass/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        class_id: currentClassId,
+        s_number: s_number,
+        reason: 'CHECKONLY'
+      })
+    });
+
+    const data = await res.json();
+    if (res.status === 400 && data.error === 'Student already has active hall pass') {
+      showErrorMessage("You already have an active hall pass.");
+      return;
+    }
+  } catch (err) {
+    console.error('Error checking hall pass status:', err);
+    showErrorMessage("Failed to check hall pass status. Please try again.");
+    return;
+  }
+
+  hallPassModal.style.display = 'flex';
+});
+
+// Close modal when cancel clicked
+hallPassCancel.addEventListener('click', () => {
+  hallPassModal.style.display = 'none';
+  hallPassForm.reset();
+});
+
+// Handle hall pass form submission
+hallPassForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const s_number = input.value.trim();
+  if (!s_number || !currentClassId) {
+    showErrorMessage("Missing student number or class selection.");
+    return;
+  }
+
+  const formData = new FormData(hallPassForm);
+  const reason = formData.get('reason');
+  const duration = parseInt(formData.get('duration'), 10);
+
+  try {
+    // Take photo and check out
+    const image_data_url = takeSnapshot();
+    
+    const res = await fetch('/api/hall-pass/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        class_id: currentClassId,
+        s_number: s_number,
+        reason: reason,
+        duration: duration,
+        photo: image_data_url
+      })
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      showErrorMessage(data.error || "Failed to check out hall pass.");
+      return;
+    }
+
+    currentHallPass = {
+      pass_id: data.pass_id,
+      checkout_time: new Date(),
+      student_name: data.student_name
+    };
+
+    // Show success message with check-in button
+    msg.innerHTML = `
+      <span class="checkmark">✓</span>
+      <span class="greeting">Hall pass checked out!</span>
+      <span class="detail">Please check in when you return.</span>
+      <button onclick="handleHallPassReturn()" style="margin-top:1rem; width:auto; padding:0.5rem 1rem">
+        Return &amp; Check In
+      </button>
+    `;
+    msg.className = 'msg success show';
+
+    // Close modal and reset form
+    hallPassModal.style.display = 'none';
+    hallPassForm.reset();
+  } catch (err) {
+    console.error('Hall pass checkout error:', err);
+    showErrorMessage("Failed to check out hall pass. Please try again.");
+  }
+});
+
+// Handle hall pass return
+async function handleHallPassReturn() {
+  if (!currentHallPass) {
+    showErrorMessage("No active hall pass found.");
+    return;
+  }
+
+  try {
+    const image_data_url = takeSnapshot();
+    
+    // Show notes input modal
+    const notes = prompt("Add any notes about the return (optional):");
+    
+    const res = await fetch('/api/hall-pass/checkin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pass_id: currentHallPass.pass_id,
+        photo: image_data_url,
+        notes: notes || ''
+      })
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Check-in failed');
+    }
+
+    if (!res.ok) {
+      const error = await res.json();
+      throw new Error(error.error || 'Check-in failed');
+    }
+
+    // Show success message
+    msg.innerHTML = `
+      <span class="checkmark">✓</span>
+      <span class="greeting">Welcome back, ${currentHallPass.student_name}!</span>
+      <span class="detail">Your hall pass has been checked in.</span>
+    `;
+    msg.className = 'msg success show';
+    
+    // Clear hall pass state
+    currentHallPass = null;
+    
+    // Re-enable the main check-in button
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Check In';
+    // Reset form
+    form.reset();
+    hallPassForm.reset();
+
+  } catch (err) {
+    console.error('Hall pass check-in error:', err);
+    showErrorMessage(err.message || "Failed to check in hall pass. Please try again.");
+  }
+}
+
+// Update hall pass visibility when class changes
+const originalUpdateClassDisplay = updateClassDisplay;
+updateClassDisplay = function() {
+  originalUpdateClassDisplay();
+  updateHallPassButton();
+};
   </script>

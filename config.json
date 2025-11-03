@@ -5,22 +5,41 @@
             "name": "Mrs. Bell 1st Period",
             "password": "bell1st2025",
             "studentsPath": "bell_1st_students.xlsx",
-            "photosPrefix": "bell_1st"
+            "photosPrefix": "bell_1st",
+            "checkInType": "hall_pass",
+            "requireComments": true,
+            "commentPrompts": {
+                "checkOut": ["Reason for leaving", "Expected duration"],
+                "checkIn": ["Additional notes"]
+            }
         },
         {
             "id": "bell_2nd",
             "name": "Mrs. Bell 2nd Period",
             "password": "bell2nd2025",
             "studentsPath": "bell_2nd_students.xlsx",
-            "photosPrefix": "bell_2nd"
+            "photosPrefix": "bell_2nd",
+            "checkInType": "meeting",
+            "requireComments": false
         },
         {
             "id": "coop_morning",
-            "name": "Co-OP Morning Period",
-            "password": "coopam2025",
+            "name": "Co-OP Morning Meeting",
+            "password": "coop2025",
             "studentsPath": "coop_morning_students.xlsx",
-            "photosPrefix": "coop_morning"
+            "photosPrefix": "coop_morning",
+            "checkInType": "hall_pass",
+            "requireComments": true,
+            "commentPrompts": {
+                "checkOut": ["Reason for leaving", "Expected duration"],
+                "checkIn": ["Additional notes"]
+            }
         }
     ],
-    "defaultClass": "bell_1st"
+    "defaultClass": "coop_morning",
+    "hallPassSettings": {
+        "requireReturnPhoto": true,
+        "maxDuration": 30,
+        "notifyTeacherOnOvertime": true
+    }
 }

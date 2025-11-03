@@ -598,6 +598,7 @@
   <div class="tabs">
     <button class="tab active" onclick="switchTab('daily')">Daily View</button>
     <button class="tab" onclick="switchTab('analytics')">Analytics</button>
+    <button class="tab" onclick="switchTab('hallpass')">Hall Pass Log</button>
   </div>
 
   <!-- Daily View Tab -->
@@ -722,11 +723,97 @@
     </div>
   </div>
 
+  <!-- Hall Pass Tab -->
+  <div id="hallpassTab" class="tab-content">
+    <div class="filters">
+      <div class="filter-group">
+        <label for="hallPassClassSelect">Select Class:</label>
+        <select id="hallPassClassSelect" onchange="loadHallPasses()">
+          {% for class in classes %}
+            <option value="{{ class.id }}" {% if class.id == current_class.id %}selected{% endif %}>
+              {{ class.name }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="filter-group">
+        <label for="hallPassDateSelect">Date:</label>
+        <select id="hallPassDateSelect" onchange="loadHallPasses()">
+          <option value="">All Dates</option>
+          {% for date in available_dates %}
+            <option value="{{ date }}">{{ date }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button class="btn" onclick="exportHallPasses()">Export Hall Passes</button>
+    </div>
+
+    <div id="hallPassLog" class="analytics-container">
+      <div class="table-controls">
+        <h3>Hall Pass Log</h3>
+        <input type="text" id="hallPassSearch" 
+               class="search-box" 
+               placeholder="Search by name or reason..." 
+               onkeyup="filterHallPasses()">
+      </div>
+
+      <table class="analytics-table" id="hallPassTable">
+        <thead>
+          <tr>
+            <th onclick="sortHallPassTable(0)">Student Name ↕</th>
+            <th onclick="sortHallPassTable(1)">S-Number ↕</th>
+            <th onclick="sortHallPassTable(2)">Check Out ↕</th>
+            <th onclick="sortHallPassTable(3)">Check In ↕</th>
+            <th onclick="sortHallPassTable(4)">Duration ↕</th>
+            <th>Reason</th>
+            <th>Status</th>
+            <th>Photos</th>
+          </tr>
+        </thead>
+        <tbody id="hallPassTableBody">
+          <!-- Will be populated via JavaScript -->
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Modal -->
   <div id="modal" class="modal" onclick="closeModal()">
     <img id="modalImg" src="" alt="full photo" onclick="event.stopPropagation()">
   </div>
 
+  <!-- Add style for duration indicators -->
+  <style>
+    .duration {
+      padding: 0.35rem 0.75rem;
+      border-radius: 20px;
+      display: inline-block;
+      font-weight: 600;
+    }
+    .duration-normal { background: #dcfce7; color: #166534; }
+    .duration-long { background: #fef3c7; color: #92400e; }
+    .duration-overdue { background: #fee2e2; color: #991b1b; }
+
+    .status-badge {
+      padding: 0.35rem 0.75rem;
+      border-radius: 20px;
+      display: inline-block;
+      font-weight: 600;
+    }
+    .status-active { background: #e0f2fe; color: #0369a1; }
+    .status-completed { background: #dcfce7; color: #166534; }
+    .status-overdue { background: #fee2e2; color: #991b1b; }
+
+    .photo-link {
+      color: #8B2121;
+      text-decoration: none;
+      cursor: pointer;
+      margin-right: 1rem;
+    }
+    .photo-link:hover {
+      text-decoration: underline;
+    }
+  </style>
 
 
   <script>
@@ -747,7 +834,215 @@
       } else if (tabName === 'analytics') {
         document.getElementById('analyticsTab').classList.add('active');
         document.querySelector('.tab:nth-child(2)').classList.add('active');
+      } else if (tabName === 'hallpass') {
+        document.getElementById('hallpassTab').classList.add('active');
+        document.querySelector('.tab:nth-child(3)').classList.add('active');
+        loadHallPasses(); // Load hall pass data when switching to tab
       }
+    }
+
+    // Format timestamp to locale string
+    function formatTimestamp(ts) {
+      if (!ts) return 'Not returned';
+      return new Date(ts).toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+      });
+    }
+
+    // Format duration
+    function formatDuration(minutes) {
+      if (!minutes) return 'N/A';
+      const hours = Math.floor(minutes / 60);
+      const mins = minutes % 60;
+      if (hours > 0) {
+        return `${hours}h ${mins}m`;
+      }
+      return `${mins}m`;
+    }
+
+    // Get duration class based on length
+    function getDurationClass(minutes) {
+      if (!minutes) return 'duration-normal';
+      if (minutes > 30) return 'duration-overdue';
+      if (minutes > 15) return 'duration-long';
+      return 'duration-normal';
+    }
+
+    // Load hall passes
+    async function loadHallPasses() {
+      const classId = document.getElementById('hallPassClassSelect').value;
+      const date = document.getElementById('hallPassDateSelect').value;
+      
+      try {
+        const response = await fetch(`/api/hall-pass/history?classId=${classId}&date=${date}`);
+        const passes = await response.json();
+        
+        const tbody = document.getElementById('hallPassTableBody');
+        tbody.innerHTML = ''; // Clear existing content
+        
+        passes.forEach(pass => {
+          const tr = document.createElement('tr');
+          
+          // Get status badge class
+          const statusClass = {
+            'active': 'status-active',
+            'completed': 'status-completed',
+            'overdue': 'status-overdue'
+          }[pass.status] || 'status-active';
+
+          const durationClass = getDurationClass(pass.actual_duration_mins);
+          
+          tr.innerHTML = `
+            <td><strong>${pass.name}</strong></td>
+            <td>S-${pass.s_number}</td>
+            <td>${formatTimestamp(pass.check_out_time)}</td>
+            <td>${formatTimestamp(pass.check_in_time)}</td>
+            <td>
+              <span class="duration ${durationClass}">
+                ${formatDuration(pass.actual_duration_mins)}
+              </span>
+            </td>
+            <td>
+              <div>${pass.check_out_reason || 'No reason given'}</div>
+              ${pass.check_in_notes ? 
+                `<div style="color:#666;margin-top:4px">${pass.check_in_notes}</div>` : 
+                ''}
+            </td>
+            <td>
+              <span class="status-badge ${statusClass}">
+                ${pass.status}
+              </span>
+            </td>
+            <td>
+              ${pass.check_out_photo ? 
+                `<a class="photo-link" onclick="showPhoto('${pass.check_out_photo}')">Out</a>` : 
+                ''}
+              ${pass.check_in_photo ? 
+                `<a class="photo-link" onclick="showPhoto('${pass.check_in_photo}')">In</a>` : 
+                ''}
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+        
+      } catch (err) {
+        console.error('Error loading hall passes:', err);
+      }
+    }
+
+    // Filter hall passes
+    function filterHallPasses() {
+      const input = document.getElementById('hallPassSearch');
+      const filter = input.value.toUpperCase();
+      const tbody = document.getElementById('hallPassTableBody');
+      const rows = tbody.getElementsByTagName('tr');
+
+      for (const row of rows) {
+        const nameCol = row.cells[0];
+        const reasonCol = row.cells[5];
+        const textToSearch = `${nameCol.textContent} ${reasonCol.textContent}`;
+        
+        if (textToSearch.toUpperCase().includes(filter)) {
+          row.style.display = '';
+        } else {
+          row.style.display = 'none';
+        }
+      }
+    }
+
+    // Sort hall pass table
+    function sortHallPassTable(columnIndex) {
+      const table = document.getElementById('hallPassTable');
+      let switching = true;
+      let shouldSwitch;
+      let switchCount = 0;
+      let dir = 'asc';
+
+      while (switching) {
+        switching = false;
+        const rows = table.rows;
+
+        for (let i = 1; i < (rows.length - 1); i++) {
+          shouldSwitch = false;
+          const x = rows[i].getElementsByTagName('TD')[columnIndex];
+          const y = rows[i + 1].getElementsByTagName('TD')[columnIndex];
+
+          let xContent = x.textContent || x.innerText;
+          let yContent = y.textContent || y.innerText;
+
+          // Handle duration column specially
+          if (columnIndex === 4) {
+            const xMatch = xContent.match(/(\d+)h.*?(\d+)m|(\d+)m/);
+            const yMatch = yContent.match(/(\d+)h.*?(\d+)m|(\d+)m/);
+            
+            // Convert to minutes for comparison
+            const xMinutes = xMatch ? 
+              (xMatch[1] ? parseInt(xMatch[1]) * 60 + parseInt(xMatch[2]) : parseInt(xMatch[3])) : 0;
+            const yMinutes = yMatch ? 
+              (yMatch[1] ? parseInt(yMatch[1]) * 60 + parseInt(yMatch[2]) : parseInt(yMatch[3])) : 0;
+              
+            xContent = xMinutes;
+            yContent = yMinutes;
+          }
+
+          if (dir === 'asc') {
+            if ((columnIndex === 2 || columnIndex === 3) && 
+                xContent !== 'Not returned' && yContent !== 'Not returned') {
+              // Compare dates
+              if (new Date(xContent) > new Date(yContent)) {
+                shouldSwitch = true;
+                break;
+              }
+            } else if (xContent > yContent) {
+              shouldSwitch = true;
+              break;
+            }
+          } else {
+            if ((columnIndex === 2 || columnIndex === 3) && 
+                xContent !== 'Not returned' && yContent !== 'Not returned') {
+              if (new Date(xContent) < new Date(yContent)) {
+                shouldSwitch = true;
+                break;
+              }
+            } else if (xContent < yContent) {
+              shouldSwitch = true;
+              break;
+            }
+          }
+        }
+
+        if (shouldSwitch) {
+          rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
+          switching = true;
+          switchCount++;
+        } else {
+          if (switchCount === 0 && dir === 'asc') {
+            dir = 'desc';
+            switching = true;
+          }
+        }
+      }
+    }
+
+    // Export hall passes
+    function exportHallPasses() {
+      const classId = document.getElementById('hallPassClassSelect').value;
+      const date = document.getElementById('hallPassDateSelect').value;
+      const dateParam = date ? `&date=${date}` : '';
+      window.location.href = `/api/hall-pass/export?classId=${classId}${dateParam}`;
+    }
+
+    // Show photo in modal
+    function showPhoto(path) {
+      const modal = document.getElementById('modal');
+      const target = document.getElementById('modalImg');
+      target.src = `/photos/${path}`;
+      modal.classList.add('open');
     }
 
     // Class and date filters
