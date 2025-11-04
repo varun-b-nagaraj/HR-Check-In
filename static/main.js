@@ -15,7 +15,7 @@ const canvas = document.getElementById("canvas");
     msg.textContent = "Camera access failed. Please allow camera permissions.";
   }
 })();
-
+// test
 function takeSnapshot() {
   const w = 640, h = 480;  // reasonable size
   canvas.width = w;
