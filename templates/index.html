@@ -52,6 +52,61 @@
       transform: translateY(0) scale(0.98);
     }
 
+    .status-toasts {
+      position: fixed;
+      right: 2rem;
+      top: 5.5rem;
+      z-index: 1050;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      max-width: 260px;
+    }
+
+    .status-toast {
+      background: white;
+      border: 1px solid #e5e5e5;
+      border-radius: 12px;
+      padding: 0.6rem 0.8rem;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #333;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      animation: toastIn 0.25s ease-out;
+    }
+
+    .status-toast.sending {
+      border-color: #93c5fd;
+      color: #1e40af;
+      background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+    }
+
+    .status-toast.sent {
+      border-color: #86efac;
+      color: #166534;
+      background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+    }
+
+    .status-toast.failed {
+      border-color: #fca5a5;
+      color: #991b1b;
+      background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+    }
+
+    @keyframes toastIn {
+      from {
+        opacity: 0;
+        transform: translateY(-6px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
     .card {
       background: white;
       max-width: 480px;
@@ -368,6 +423,7 @@
   <div class="topbar">
     <a href="/history" title="History / Admin" aria-label="Settings">⚙️</a>
   </div>
+  <div id="statusToasts" class="status-toasts" aria-live="polite"></div>
 
   <!-- Small live preview in top-left so users know they're being recorded -->
   <div id="previewContainer" class="preview-container" aria-hidden="false">
@@ -392,7 +448,7 @@
           id="snum" 
           name="snum" 
           type="text"
-          placeholder="e.g., 151579" 
+          placeholder="e.g., s151579 or 151579" 
           required 
           autocomplete="off"
         />
@@ -427,6 +483,16 @@ const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
 const submitBtn = document.getElementById("submitBtn");
 const input = document.getElementById("snum");
+const statusToasts = document.getElementById("statusToasts");
+
+const QUEUE_KEY = "checkinQueueV1";
+const ROSTER_CACHE_KEY = "rosterCacheV1";
+const ROSTER_CACHE_TTL_MS = 30 * 60 * 1000;
+const MAX_IN_FLIGHT = 3;
+const sendingIds = new Set();
+const toastMap = new Map();
+let inFlightCount = 0;
+let rosterMap = null;
 
 // Prepare camera stream on load so it's ready to snap with no preview
 (async function initCamera() {
@@ -451,21 +517,14 @@ function takeSnapshot() {
 }
 
 // Helper functions for styled messages
-function showCheckinMessage(firstName) {
+function showCachedMessage(firstName) {
+  const safeName = (firstName || "").trim();
   msg.innerHTML = `
     <span class="checkmark">✓</span>
-    <span class="greeting">Welcome, ${firstName}!</span>
-    <span class="detail">You've been checked in successfully.</span>
+    <span class="greeting">Hello${safeName ? `, ${safeName}` : ""}!</span>
+    <span class="detail">Your check-in is cached and will be sent shortly.</span>
   `;
   msg.className = 'msg success show';
-}
-
-function showAlreadyCheckedIn(firstName) {
-  msg.innerHTML = `
-    <span class="greeting">Hi, ${firstName}!</span>
-    <span class="detail">You're already checked in today.</span>
-  `;
-  msg.className = 'msg info show';
 }
 
 function showErrorMessage(message) {
@@ -473,13 +532,163 @@ function showErrorMessage(message) {
   msg.className = 'msg error show';
 }
 
-function showLoadingMessage(message) {
-  msg.textContent = message;
-  msg.className = 'msg info show';
-}
-
 function hideMessage() {
   msg.classList.remove('show');
+}
+
+function normalizeSNumber(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const stripped = raw[0] && raw[0].toLowerCase() === "s" ? raw.slice(1) : raw;
+  return stripped.replace(/\D/g, "");
+}
+
+function readQueue() {
+  try {
+    return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+
+function writeQueue(queue) {
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+}
+
+function addToQueue(entry) {
+  const queue = readQueue();
+  queue.push(entry);
+  writeQueue(queue);
+}
+
+function removeFromQueue(id) {
+  const queue = readQueue().filter((entry) => entry.id !== id);
+  writeQueue(queue);
+}
+
+function buildRosterMap(students) {
+  const map = new Map();
+  (students || []).forEach((student) => {
+    const key = normalizeSNumber(student.s_number);
+    if (key) map.set(key, student.name);
+  });
+  return map;
+}
+
+function getRosterMap() {
+  if (rosterMap) return rosterMap;
+  try {
+    const cached = JSON.parse(localStorage.getItem(ROSTER_CACHE_KEY) || "null");
+    if (cached && cached.students) {
+      rosterMap = buildRosterMap(cached.students);
+      return rosterMap;
+    }
+  } catch (e) {}
+  rosterMap = new Map();
+  return rosterMap;
+}
+
+async function refreshRosterCache() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(ROSTER_CACHE_KEY) || "null");
+    if (cached && cached.ts && Date.now() - cached.ts < ROSTER_CACHE_TTL_MS) {
+      rosterMap = buildRosterMap(cached.students);
+      return;
+    }
+  } catch (e) {}
+
+  try {
+    const res = await fetch("/roster/public");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.students)) return;
+    localStorage.setItem(ROSTER_CACHE_KEY, JSON.stringify({ ts: Date.now(), students: data.students }));
+    rosterMap = buildRosterMap(data.students);
+  } catch (err) {
+    console.error("Roster cache error:", err);
+  }
+}
+
+function showStatusToast(id, status, sNumber, customText) {
+  const normalized = normalizeSNumber(sNumber);
+  const label = normalized ? `S-${normalized}` : "S-number";
+  let text = customText;
+  if (!text) {
+    if (status === "sending") text = `Sending ${label} to backend...`;
+    if (status === "sent") text = `${label} sent to backend.`;
+    if (status === "failed") text = `${label} failed to send. Will retry.`;
+  }
+
+  let toast = toastMap.get(id);
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.className = "status-toast";
+    statusToasts.appendChild(toast);
+    toastMap.set(id, toast);
+  }
+
+  toast.textContent = text;
+  toast.className = `status-toast ${status}`;
+
+  if (status === "sent" || status === "failed") {
+    setTimeout(() => {
+      if (toast && toast.parentNode) {
+        toast.parentNode.removeChild(toast);
+      }
+      toastMap.delete(id);
+    }, 3500);
+  }
+}
+
+function processQueue() {
+  const queue = readQueue();
+  if (!queue.length) return;
+
+  for (const entry of queue) {
+    if (inFlightCount >= MAX_IN_FLIGHT) break;
+    if (sendingIds.has(entry.id)) continue;
+    sendEntry(entry);
+  }
+}
+
+async function sendEntry(entry) {
+  sendingIds.add(entry.id);
+  inFlightCount += 1;
+  showStatusToast(entry.id, "sending", entry.s_number_norm);
+
+  try {
+    const res = await fetch("/checkin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        s_number: entry.s_number_raw,
+        image_data_url: entry.image_data_url
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (res.ok && data.ok) {
+      if (data.status === "already") {
+        showStatusToast(entry.id, "sent", entry.s_number_norm, `S-${entry.s_number_norm} already checked in today.`);
+      } else {
+        showStatusToast(entry.id, "sent", entry.s_number_norm);
+      }
+      removeFromQueue(entry.id);
+    } else {
+      const errText = data.error || "Check-in failed.";
+      showStatusToast(entry.id, "failed", entry.s_number_norm, `S-${entry.s_number_norm} ${errText}`);
+      if (res.status >= 400 && res.status < 500) {
+        removeFromQueue(entry.id);
+      }
+    }
+  } catch (err) {
+    console.error("Send error:", err);
+    showStatusToast(entry.id, "failed", entry.s_number_norm);
+  } finally {
+    sendingIds.delete(entry.id);
+    inFlightCount = Math.max(0, inFlightCount - 1);
+    processQueue();
+  }
 }
 
 // Clear message when user starts typing
@@ -491,63 +700,61 @@ input.addEventListener('input', () => {
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  
-  // Show loading state
-  submitBtn.disabled = true;
-  submitBtn.innerHTML = '<span class="spinner"></span>Checking in...';
-  showLoadingMessage("Checking in…");
 
-  const s_number = input.value.trim();
-  if (!s_number) {
+  submitBtn.disabled = true;
+
+  const rawNumber = input.value.trim();
+  if (!rawNumber) {
     showErrorMessage("Please enter your s-number.");
     submitBtn.disabled = false;
     submitBtn.textContent = 'Check In';
     return;
   }
 
-  // Auto capture; no preview
-  const image_data_url = takeSnapshot();
-
-  try {
-    const res = await fetch("/checkin", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ s_number, image_data_url })
-    });
-    const data = await res.json();
-
-    if (!data.ok) {
-      showErrorMessage(data.error || "Check-in failed.");
-      submitBtn.disabled = false;
-      submitBtn.textContent = 'Check In';
-      return;
-    }
-
-    if (data.status === "already") {
-      showAlreadyCheckedIn(data.first_name);
-    } else {
-      showCheckinMessage(data.first_name);
-    }
-
-    form.reset();
-    
-    // Reset button after short delay
-    setTimeout(() => {
-      submitBtn.disabled = false;
-      submitBtn.textContent = 'Check In';
-    }, 2000);
-    
-  } catch (err) {
-    console.error(err);
-    showErrorMessage("Network error. Please try again.");
+  const normalized = normalizeSNumber(rawNumber);
+  if (!normalized) {
+    showErrorMessage("Please enter a valid s-number.");
     submitBtn.disabled = false;
     submitBtn.textContent = 'Check In';
+    return;
   }
+
+  const image_data_url = takeSnapshot();
+
+  const name = getRosterMap().get(normalized);
+  if (!name) {
+    refreshRosterCache();
+  }
+  showCachedMessage(name);
+
+  const entry = {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    s_number_raw: rawNumber,
+    s_number_norm: normalized,
+    image_data_url,
+    created_at: new Date().toISOString()
+  };
+
+  addToQueue(entry);
+  processQueue();
+
+  form.reset();
+  setTimeout(() => {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Check In';
+  }, 250);
 });
 
 // Auto-focus input on load
 window.addEventListener('load', () => {
   input.focus();
+  refreshRosterCache();
+  processQueue();
+  setInterval(processQueue, 5000);
+});
+
+window.addEventListener('online', () => {
+  processQueue();
 });
 
 // ------------------ Preview + password-protected toggle ------------------

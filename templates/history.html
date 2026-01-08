@@ -614,9 +614,9 @@
         <div class="card">
           {% if p.photo_path %}
             <img class="thumb" 
-                 src="{{ url_for('serve_photo', filename=p.photo_path) }}"
+                 src="{{ p.photo_path }}"
                  alt="photo {{ p.name }}" 
-                 data-full="{{ url_for('serve_photo', filename=p.photo_path) }}">
+                 data-full="{{ p.photo_path }}">
           {% else %}
             <div class="no-photo">No Photo</div>
           {% endif %}

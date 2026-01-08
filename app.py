@@ -1,46 +1,111 @@
 import base64
 import io
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
 from flask import (
     Flask, jsonify, render_template, request,
-    redirect, url_for, session, send_from_directory, send_file
+    redirect, url_for, session, send_file
 )
-from openpyxl import Workbook, load_workbook
-from openpyxl.drawing.image import Image as XLImage
+from dotenv import load_dotenv
 from PIL import Image
+from supabase import create_client, Client
 from zoneinfo import ZoneInfo
-from openpyxl.styles import PatternFill, Font
-from openpyxl.chart import BarChart, Reference
 
 APP_DIR = Path(__file__).parent.resolve()
-ROSTER_PATH = APP_DIR / "students.xlsx"   # <-- your roster
-PHOTOS_ROOT = APP_DIR / "photos"          # we now KEEP a copy for history page
-PHOTOS_ROOT.mkdir(exist_ok=True)
+ENV_DIR = APP_DIR / ".env"
+ENV_PATH = ENV_DIR / "supabase.env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+
+SUPABASE_PHOTOS_BUCKET = os.getenv("SUPABASE_PHOTOS_BUCKET", "checkin-photos")
+_supabase_client = None
+_supabase_url = None
 
 # ---- Admin password + session secret
-ADMIN_PASSWORD = "abhiMora1!"             # <--- you set this
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "abhiMora1!")
 SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "change-me-please")
 # -------------------------------------
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    template_folder=str(APP_DIR / "templates"),
+    static_folder=str(APP_DIR / "static"),
+)
 app.secret_key = SECRET_KEY
 
 
-def load_roster():
-    if not ROSTER_PATH.exists():
-        raise FileNotFoundError("students.xlsx not found next to app.py")
-    df = pd.read_excel(ROSTER_PATH)
-    cols = {c.lower().strip(): c for c in df.columns}
-    name_col = cols.get("name") or cols.get("student") or "Name"
-    snum_col = cols.get("s-number") or cols.get("s number") or "s-number"
-    df = df.rename(columns={name_col: "Name", snum_col: "s-number"})
-    df["s-number"] = df["s-number"].astype(str).str.strip()
-    df["Name"] = df["Name"].astype(str).str.strip()
-    return df[["Name", "s-number"]]
+def get_supabase_client():
+    global _supabase_client, _supabase_url
+    if _supabase_client and _supabase_url:
+        return _supabase_client, _supabase_url
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+    if not supabase_url or not supabase_key:
+        raise RuntimeError("Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY.")
+
+    _supabase_url = supabase_url
+    _supabase_client = create_client(supabase_url, supabase_key)
+    return _supabase_client, _supabase_url
+
+
+def normalize_s_number(raw_value: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    if value[:1].lower() == "s":
+        value = value[1:]
+    return re.sub(r"\D", "", value)
+
+
+def format_timestamp(value) -> str:
+    if not value:
+        return ""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value)
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("America/Chicago"))
+    local = dt.astimezone(ZoneInfo("America/Chicago"))
+    return local.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def require_supabase_data(result, context: str):
+    if getattr(result, "error", None):
+        raise RuntimeError(f"{context}: {result.error}")
+    return result.data or []
+
+
+def fetch_students():
+    client, _ = get_supabase_client()
+    result = client.table("students").select("name, s_number").order("name").execute()
+    return require_supabase_data(result, "students select failed")
+
+
+def fetch_attendance_for_date(date_str: str):
+    client, _ = get_supabase_client()
+    result = (
+        client.table("attendance")
+        .select("s_number, name, checkin_ts, photo_path")
+        .eq("checkin_date", date_str)
+        .order("checkin_ts")
+        .execute()
+    )
+    return require_supabase_data(result, "attendance select failed")
+
+
+def fetch_attendance_basic():
+    client, _ = get_supabase_client()
+    result = client.table("attendance").select("s_number, checkin_date").execute()
+    return require_supabase_data(result, "attendance analytics select failed")
 
 
 def get_today_str():
@@ -48,139 +113,84 @@ def get_today_str():
     return datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
 
 
-def get_today_xlsx_path():
-    return APP_DIR / f"attendance_{get_today_str()}.xlsx"
-
-
-def ensure_workbook(path: Path):
-    if path.exists():
-        wb = load_workbook(path)
-        ws = wb.active
-        return wb, ws
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Attendance"
-    # Added a 5th column PhotoPath for the history page (Photo is still embedded)
-    ws.append(["S-Number", "Name", "Timestamp", "Photo", "PhotoPath"])
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 24
-    ws.column_dimensions["C"].width = 22
-    ws.column_dimensions["D"].width = 18
-    ws.column_dimensions["E"].width = 36
-    wb.save(path)
-    return wb, ws
-
-
-def already_checked_in(ws, s_number: str):
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if str(row[0]).strip() == s_number:
-            return True
-    return False
-
-
 def first_name(full_name: str) -> str:
     return (full_name or "").split()[0] if full_name else ""
 
 
-def save_and_embed_photo(ws, row_idx: int, data_url: str, s_number: str):
-    # Decode data URL to PIL image
-    header, b64data = data_url.split(",", 1)
+def save_photo(data_url: str, s_number: str) -> str:
+    client, supabase_url = get_supabase_client()
+    _, b64data = data_url.split(",", 1)
     binary = base64.b64decode(b64data)
     pil_img = Image.open(io.BytesIO(binary))
 
-    # Resize to keep Excel light
+    # Resize to keep uploads light
     max_w, max_h = 240, 180
     pil_img.thumbnail((max_w, max_h))
 
-    # Keep a copy on disk for the History page
-    day_dir = PHOTOS_ROOT / get_today_str()
-    day_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%H%M%S")
+    buffer = io.BytesIO()
+    pil_img.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    date_str = get_today_str()
+    ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%H%M%S%f")
     filename = f"{s_number}_{ts}.png"
-    file_path = day_dir / filename
-    pil_img.save(file_path, format="PNG")
+    storage_path = f"{date_str}/{filename}"
 
-    # Embed into Excel (column D)
-    xl_img = XLImage(str(file_path))
-    cell_addr = f"D{row_idx}"
-    ws.add_image(xl_img, cell_addr)
-    ws.row_dimensions[row_idx].height = 140
+    upload_result = client.storage.from_(SUPABASE_PHOTOS_BUCKET).upload(
+        storage_path,
+        buffer.getvalue(),
+        {"content-type": "image/png", "upsert": "true"},
+    )
+    if getattr(upload_result, "error", None):
+        raise RuntimeError(f"photo upload failed: {upload_result.error}")
 
-    # Return relative web path for later display
-    web_path = f"{get_today_str()}/{filename}"  # served via /photos/<path>
-    return web_path
+    base_url = supabase_url.rstrip("/")
+    public_url = f"{base_url}/storage/v1/object/public/{SUPABASE_PHOTOS_BUCKET}/{storage_path}"
+    return public_url
 
 
-def calculate_analytics(roster, available_dates):
+def calculate_analytics(students, attendance_rows, available_dates):
     """Calculate attendance analytics across all sessions"""
     total_sessions = len(available_dates)
-    total_students = len(roster)
-    
-    # Track attendance for each student
-    student_records = {}
-    
-    for _, student in roster.iterrows():
-        s_num = str(student["s-number"])
-        student_records[s_num] = {
-            "name": student["Name"],
-            "s_number": s_num,
+    total_students = len(students)
+
+    student_records = {
+        str(student["s_number"]): {
+            "name": student["name"],
+            "s_number": str(student["s_number"]),
             "present_count": 0,
-            "absent_count": 0
+            "absent_count": 0,
         }
-    
-    # Count attendance across all dates
-    for date in available_dates:
-        xlsx_path = APP_DIR / f"attendance_{date}.xlsx"
-        if not xlsx_path.exists():
-            continue
-            
-        wb = load_workbook(xlsx_path, data_only=True)
-        ws = wb.active
-        present_on_date = set()
-        
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]:
-                continue
-            s_num = str(row[0]).strip()
-            present_on_date.add(s_num)
-        
-        # Update counts
-        for s_num in student_records:
-            if s_num in present_on_date:
-                student_records[s_num]["present_count"] += 1
-            else:
-                student_records[s_num]["absent_count"] += 1
-    
-    # Calculate attendance rates
+        for student in students
+    }
+
+    for row in attendance_rows:
+        s_num = str(row.get("s_number", "")).strip()
+        if s_num in student_records:
+            student_records[s_num]["present_count"] += 1
+
     students_list = []
     total_attendance = 0
-    
-    for s_num, record in student_records.items():
+
+    for record in student_records.values():
         if total_sessions > 0:
             attendance_rate = (record["present_count"] / total_sessions) * 100
         else:
             attendance_rate = 0
-        
-        students_list.append({
-            "name": record["name"],
-            "s_number": record["s_number"],
-            "present_count": record["present_count"],
-            "absent_count": record["absent_count"],
-            "attendance_rate": attendance_rate
-        })
+
+        record["absent_count"] = total_sessions - record["present_count"]
+        record["attendance_rate"] = attendance_rate
+        students_list.append(record)
         total_attendance += attendance_rate
-    
-    # Calculate average attendance
+
     avg_attendance = total_attendance / total_students if total_students > 0 else 0
-    
-    # Sort by name
     students_list.sort(key=lambda x: x["name"])
-    
+
     return {
         "total_sessions": total_sessions,
         "total_students": total_students,
         "avg_attendance": avg_attendance,
-        "students": students_list
+        "students": students_list,
     }
 
 
@@ -192,7 +202,7 @@ def index():
 @app.route("/checkin", methods=["POST"])
 def checkin():
     payload = request.get_json(force=True)
-    s_number = str(payload.get("s_number", "")).strip()
+    s_number = normalize_s_number(payload.get("s_number", ""))
     photo_data_url = payload.get("image_data_url")
 
     if not s_number:
@@ -201,35 +211,53 @@ def checkin():
         return jsonify({"ok": False, "error": "Missing or invalid photo"}), 400
 
     # Lookup roster
-    roster = load_roster()
-    match = roster.loc[roster["s-number"] == s_number]
-    if match.empty:
+    client, _ = get_supabase_client()
+    student_result = (
+        client.table("students")
+        .select("name, s_number")
+        .eq("s_number", s_number)
+        .limit(1)
+        .execute()
+    )
+    student_data = require_supabase_data(student_result, "student lookup failed")
+    if not student_data:
         return jsonify({"ok": False, "error": "S-number not found"}), 404
 
-    full_name = match.iloc[0]["Name"]
+    full_name = student_data[0]["name"]
     fname = first_name(full_name)
 
-    # Prepare workbook
-    xlsx_path = get_today_xlsx_path()
-    wb, ws = ensure_workbook(xlsx_path)
-
     # Only first check-in counts today
-    if already_checked_in(ws, s_number):
+    today = get_today_str()
+    existing_result = (
+        client.table("attendance")
+        .select("id")
+        .eq("s_number", s_number)
+        .eq("checkin_date", today)
+        .limit(1)
+        .execute()
+    )
+    existing_rows = require_supabase_data(existing_result, "attendance lookup failed")
+    if existing_rows:
         return jsonify({"ok": True, "status": "already", "first_name": fname})
 
     # Central time timestamp
     now = datetime.now(ZoneInfo("America/Chicago"))
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    timestamp = now.isoformat()
 
-    # Append row first (Photo + PhotoPath filled after)
-    ws.append([s_number, full_name, timestamp, "", ""])
-    row_idx = ws.max_row
-
-    # Embed photo, keep file, and write PhotoPath (col E)
-    web_path = save_and_embed_photo(ws, row_idx, photo_data_url, s_number)
-    ws.cell(row=row_idx, column=5, value=web_path)
-
-    wb.save(xlsx_path)
+    # Save photo locally and store a relative path in Supabase
+    web_path = save_photo(photo_data_url, s_number)
+    insert_result = (
+        client.table("attendance")
+        .insert({
+            "s_number": s_number,
+            "name": full_name,
+            "checkin_ts": timestamp,
+            "checkin_date": today,
+            "photo_path": web_path,
+        })
+        .execute()
+    )
+    require_supabase_data(insert_result, "attendance insert failed")
 
     return jsonify({"ok": True, "status": "new", "first_name": fname})
 
@@ -255,54 +283,46 @@ def history():
 
     # Get selected date from query param, default to today
     selected_date = request.args.get("date", get_today_str())
-    
-    # Get all available dates (all attendance files)
-    available_dates = []
-    for file in sorted(APP_DIR.glob("attendance_*.xlsx"), reverse=True):
-        date_str = file.stem.replace("attendance_", "")
-        available_dates.append(date_str)
-    
-    if not available_dates:
-        available_dates = [get_today_str()]
+
+    attendance_basic = fetch_attendance_basic()
+    available_dates_raw = sorted(
+        {str(row["checkin_date"]) for row in attendance_basic if row.get("checkin_date")},
+        reverse=True,
+    )
+    available_dates = available_dates_raw or [get_today_str()]
 
     # Load roster
-    roster = load_roster()
-    roster["s-number"] = roster["s-number"].astype(str)
+    students = fetch_students()
 
     # Get data for selected date
-    xlsx_path = APP_DIR / f"attendance_{selected_date}.xlsx"
     present = []
     present_ids = set()
-
-    if xlsx_path.exists():
-        wb = load_workbook(xlsx_path, data_only=True)
-        ws = wb.active
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]:
-                continue
-            s_num = str(row[0]).strip()
-            present_ids.add(s_num)
-            # Safe read for optional PhotoPath column
-            photo_path = ""
-            if len(row) > 4 and row[4]:
-                photo_path = row[4]
-            present.append({
-                "s_number": s_num,
-                "name": row[1],
-                "timestamp": row[2],
-                "photo_path": photo_path,
-            })
+    for row in fetch_attendance_for_date(selected_date):
+        s_num = str(row.get("s_number", "")).strip()
+        if not s_num:
+            continue
+        present_ids.add(s_num)
+        present.append({
+            "s_number": s_num,
+            "name": row.get("name"),
+            "timestamp": format_timestamp(row.get("checkin_ts")),
+            "photo_path": row.get("photo_path") or "",
+        })
 
     # Absent = roster - present_ids for selected date
-    absent_df = roster[~roster["s-number"].isin(present_ids)].copy()
-    absent_df = absent_df.sort_values(by="Name")
+    absent = []
+    for student in students:
+        s_num = str(student.get("s_number", "")).strip()
+        if s_num and s_num not in present_ids:
+            absent.append({"Name": student.get("name"), "s-number": s_num})
+    absent.sort(key=lambda x: x.get("Name") or "")
 
     # Calculate analytics across all dates
-    analytics = calculate_analytics(roster, available_dates)
+    analytics = calculate_analytics(students, attendance_basic, available_dates_raw)
 
     return render_template("history.html",
                            present=present,
-                           absent=absent_df.to_dict(orient="records"),
+                           absent=absent,
                            selected_date=selected_date,
                            today=get_today_str(),
                            available_dates=available_dates,
@@ -313,12 +333,6 @@ def history():
 def logout():
     session.clear()
     return redirect(url_for("history"))
-
-
-# Serve saved photos (e.g., /photos/2025-10-28/151579_231405.png)
-@app.route("/photos/<path:filename>")
-def serve_photo(filename):
-    return send_from_directory(PHOTOS_ROOT, filename, as_attachment=False)
 
 
 @app.route("/verify_password", methods=["POST"])
@@ -340,8 +354,16 @@ def verify_password():
 def get_roster():
     if not is_authed():
         return jsonify({'ok': False, 'error': 'unauthorized'}), 403
-    df = load_roster()
-    return jsonify({'ok': True, 'students': df.to_dict(orient='records')})
+    students = fetch_students()
+    payload = [{"Name": s["name"], "s-number": s["s_number"]} for s in students]
+    return jsonify({'ok': True, 'students': payload})
+
+
+@app.route('/roster/public', methods=['GET'])
+def get_roster_public():
+    students = fetch_students()
+    payload = [{"name": s["name"], "s_number": s["s_number"]} for s in students]
+    return jsonify({'ok': True, 'students': payload})
 
 
 @app.route('/roster/add', methods=['POST'])
@@ -365,32 +387,27 @@ def add_roster():
     if not entries:
         return jsonify({'ok': False, 'error': 'no entries provided'}), 400
 
-    # Load existing roster
-    df = pd.read_excel(ROSTER_PATH)
-    # Normalize column names
-    cols = {c.lower().strip(): c for c in df.columns}
-    name_col = cols.get('name') or cols.get('student') or 'Name'
-    snum_col = cols.get('s-number') or cols.get('s number') or 's-number'
-    # Ensure columns exist
-    if name_col not in df.columns:
-        df[name_col] = ''
-    if snum_col not in df.columns:
-        df[snum_col] = ''
+    existing_students = fetch_students()
+    existing_numbers = {str(s["s_number"]).strip() for s in existing_students if s.get("s_number")}
 
     added = []
+    to_insert = []
     for ent in entries:
         n = (ent.get('Name') or ent.get('name') or '').strip()
-        s = str(ent.get('s-number') or ent.get('s_number') or '').strip()
+        s = normalize_s_number(ent.get('s-number') or ent.get('s_number') or '')
         if not n or not s:
             continue
         # check for duplicates by s-number
-        if ((df[snum_col].astype(str).str.strip()) == s).any():
+        if s in existing_numbers:
             continue
-        df = df.append({name_col: n, snum_col: s}, ignore_index=True)
+        existing_numbers.add(s)
+        to_insert.append({"name": n, "s_number": s})
         added.append({'Name': n, 's-number': s})
 
-    # Save back to students.xlsx
-    df.to_excel(ROSTER_PATH, index=False)
+    if to_insert:
+        client, _ = get_supabase_client()
+        insert_result = client.table("students").insert(to_insert).execute()
+        require_supabase_data(insert_result, "students insert failed")
 
     return jsonify({'ok': True, 'added': added})
 
@@ -398,8 +415,10 @@ def add_roster():
 # ---------- EXPORT endpoints (admin only) ----------
 def _make_attendance_export(selected_date: str):
     # Build a workbook combining roster and attendance for selected_date
-    roster = load_roster()
-    xlsx_path = APP_DIR / f"attendance_{selected_date}.xlsx"
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill
+
+    roster = fetch_students()
 
     wb = Workbook()
     ws = wb.active
@@ -410,27 +429,24 @@ def _make_attendance_export(selected_date: str):
 
     present_ids = set()
     attendance_map = {}
-    if xlsx_path.exists():
-        awb = load_workbook(xlsx_path, data_only=True)
-        aws = awb.active
-        for row in aws.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]:
-                continue
-            s_num = str(row[0]).strip()
-            present_ids.add(s_num)
-            attendance_map[s_num] = {
-                'timestamp': row[2] if len(row) > 2 else '',
-                'photo_path': row[4] if len(row) > 4 else ''
-            }
+    for row in fetch_attendance_for_date(selected_date):
+        s_num = str(row.get("s_number", "")).strip()
+        if not s_num:
+            continue
+        present_ids.add(s_num)
+        attendance_map[s_num] = {
+            'timestamp': format_timestamp(row.get("checkin_ts")),
+            'photo_path': row.get("photo_path") or ''
+        }
 
     red_fill = PatternFill(start_color='FFEFEF', end_color='FFEFEF', fill_type='solid')
 
     # Split roster so absentees appear first
     absent_list = []
     present_list = []
-    for student in roster.to_dict(orient='records'):
-        s = str(student.get('s-number', '')).strip()
-        name = student.get('Name', '')
+    for student in roster:
+        s = str(student.get('s_number', '')).strip()
+        name = student.get('name', '')
         present = 'Yes' if s in present_ids else 'No'
         ts = attendance_map.get(s, {}).get('timestamp', '')
         photo = attendance_map.get(s, {}).get('photo_path', '')
@@ -440,9 +456,6 @@ def _make_attendance_export(selected_date: str):
         else:
             present_list.append(record)
 
-    # set photo column width and default
-    ws.column_dimensions['E'].width = 22
-
     for record in (absent_list + present_list):
         s = record['s']
         name = record['name']
@@ -450,29 +463,12 @@ def _make_attendance_export(selected_date: str):
         ts = record['ts']
         photo = record['photo']
 
-        # Append row and embed photo into column E sized to the cell
-        ws.append([s, name, ts, present, ""])
-        row_idx = ws.max_row
-
-        if photo:
-            photo_path = PHOTOS_ROOT / photo
-            if photo_path.exists():
-                try:
-                    xl_img = XLImage(str(photo_path))
-                    # Resize image to fit into the cell (approx)
-                    # column width 22 -> approx 22*7 = 154 px
-                    xl_img.width = 154
-                    xl_img.height = 90
-                    cell_addr = f"E{row_idx}"
-                    ws.add_image(xl_img, cell_addr)
-                    ws.row_dimensions[row_idx].height = 70
-                except Exception:
-                    ws.cell(row=row_idx, column=5, value=photo)
-            else:
-                ws.cell(row=row_idx, column=5, value=photo)
+        # Store the public photo URL in the export
+        ws.append([s, name, ts, present, photo or ""])
 
         # Highlight absentees (they are at top already)
         if present == 'No':
+            row_idx = ws.max_row
             for col in range(1, len(headers) + 1):
                 ws.cell(row=row_idx, column=col).fill = red_fill
 
@@ -483,8 +479,20 @@ def _make_attendance_export(selected_date: str):
 def export_students():
     if not is_authed():
         return redirect(url_for('history'))
-    # Serve the students.xlsx file for download
-    return send_from_directory(APP_DIR, ROSTER_PATH.name, as_attachment=True)
+    from openpyxl import Workbook
+
+    students = fetch_students()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Students'
+    ws.append(['Name', 'S-Number'])
+    for student in students:
+        ws.append([student.get('name', ''), student.get('s_number', '')])
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return send_file(bio, as_attachment=True, download_name="students.xlsx", mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
 @app.route('/export/attendance')
@@ -504,13 +512,16 @@ def export_analytics():
     if not is_authed():
         return redirect(url_for('history'))
     # Generate analytics workbook (simple CSV-like sheet + bar chart)
-    # Collect dates
-    available_dates = []
-    for file in sorted(APP_DIR.glob("attendance_*.xlsx"), reverse=True):
-        date_str = file.stem.replace("attendance_", "")
-        available_dates.append(date_str)
-    roster = load_roster()
-    analytics = calculate_analytics(roster, available_dates)
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference
+
+    attendance_basic = fetch_attendance_basic()
+    available_dates = sorted(
+        {str(row["checkin_date"]) for row in attendance_basic if row.get("checkin_date")},
+        reverse=True,
+    )
+    students = fetch_students()
+    analytics = calculate_analytics(students, attendance_basic, available_dates)
 
     wb = Workbook()
     ws = wb.active
