@@ -92,6 +92,7 @@ def fetch_students():
 
 def fetch_attendance_for_date(date_str: str):
     client, _ = get_supabase_client()
+    date_str = normalize_date_string(date_str)
     result = (
         client.table("attendance")
         .select("s_number, name, checkin_ts, photo_path")
@@ -111,6 +112,18 @@ def fetch_attendance_basic():
 def get_today_str():
     # Explicit US Central (handles CST/CDT correctly)
     return datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
+
+
+def normalize_date_string(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Accept ISO date or datetime; keep YYYY-MM-DD
+    if "T" in text:
+        return text.split("T", 1)[0]
+    if " " in text:
+        return text.split(" ", 1)[0]
+    return text
 
 
 def first_name(full_name: str) -> str:
@@ -282,14 +295,16 @@ def history():
         return render_template("history_login.html")
 
     # Get selected date from query param, default to today
-    selected_date = request.args.get("date", get_today_str())
+    selected_date = normalize_date_string(request.args.get("date", get_today_str()))
 
     attendance_basic = fetch_attendance_basic()
     available_dates_raw = sorted(
-        {str(row["checkin_date"]) for row in attendance_basic if row.get("checkin_date")},
+        {normalize_date_string(row["checkin_date"]) for row in attendance_basic if row.get("checkin_date")},
         reverse=True,
     )
     available_dates = available_dates_raw or [get_today_str()]
+    if selected_date not in available_dates:
+        selected_date = available_dates[0]
 
     # Load roster
     students = fetch_students()
@@ -418,6 +433,7 @@ def _make_attendance_export(selected_date: str):
     from openpyxl import Workbook
     from openpyxl.styles import PatternFill
 
+    selected_date = normalize_date_string(selected_date)
     roster = fetch_students()
 
     wb = Workbook()
@@ -499,7 +515,7 @@ def export_students():
 def export_attendance():
     if not is_authed():
         return redirect(url_for('history'))
-    selected_date = request.args.get('date', get_today_str())
+    selected_date = normalize_date_string(request.args.get('date', get_today_str()))
     wb = _make_attendance_export(selected_date)
     bio = io.BytesIO()
     wb.save(bio)
@@ -517,7 +533,7 @@ def export_analytics():
 
     attendance_basic = fetch_attendance_basic()
     available_dates = sorted(
-        {str(row["checkin_date"]) for row in attendance_basic if row.get("checkin_date")},
+        {normalize_date_string(row["checkin_date"]) for row in attendance_basic if row.get("checkin_date")},
         reverse=True,
     )
     students = fetch_students()
