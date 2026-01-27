@@ -19,7 +19,7 @@ ENV_DIR = APP_DIR / ".env"
 ENV_PATH = ENV_DIR / "supabase.env"
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
-
+# update from system env as well
 SUPABASE_PHOTOS_BUCKET = os.getenv("SUPABASE_PHOTOS_BUCKET", "checkin-photos")
 _supabase_client = None
 _supabase_url = None
